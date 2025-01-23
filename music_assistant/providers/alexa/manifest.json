@@ -4,6 +4,6 @@
   "name": "Alexa",
   "description": "Short description of the player provider goes here",
   "codeowners": ["@yourgithubusername"],
-  "requirements": [],
+  "requirements": ["alexapy==1.29.5"],
   "documentation": "Link to the documentation on the music-assistant.io helppage (may be added later)."
 }
