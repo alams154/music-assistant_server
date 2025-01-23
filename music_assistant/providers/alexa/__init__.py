@@ -39,7 +39,14 @@ from alexapy import (
     AlexaAPI,
     AlexaLogin,
 )
-from music_assistant_models.enums import PlayerFeature, PlayerState, PlayerType, ProviderFeature
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.enums import (
+    ConfigEntryType,
+    PlayerFeature,
+    PlayerState,
+    PlayerType,
+    ProviderFeature,
+)
 from music_assistant_models.player import DeviceInfo, Player, PlayerMedia
 
 from music_assistant.constants import (
@@ -47,6 +54,8 @@ from music_assistant.constants import (
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_ENFORCE_MP3_DEFAULT_ENABLED,
     CONF_ENTRY_FLOW_MODE_ENFORCED,
+    CONF_PASSWORD,
+    CONF_USERNAME,
 )
 from music_assistant.models.player_provider import PlayerProvider
 
@@ -54,7 +63,6 @@ _LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import (
-        ConfigEntry,
         ConfigValueType,
         PlayerConfig,
         ProviderConfig,
@@ -63,6 +71,8 @@ if TYPE_CHECKING:
 
     from music_assistant import MusicAssistant
     from music_assistant.models import ProviderInstanceType
+
+CONF_URL = "url"
 
 
 async def setup(
@@ -95,7 +105,13 @@ async def get_config_entries(
     # The ConfigValueType is an Enum that represents the type of value that
     # can be stored in a ConfigEntry.
     # If your provider does not need any configuration, you can return an empty tuple.
-    return ()
+    return (
+        ConfigEntry(key=CONF_URL, type=ConfigEntryType.STRING, label="URL", required=True),
+        ConfigEntry(key=CONF_USERNAME, type=ConfigEntryType.STRING, label="E-Mail", required=True),
+        ConfigEntry(
+            key=CONF_PASSWORD, type=ConfigEntryType.STRING, label="Password", required=True
+        ),
+    )
 
 
 class MyDemoPlayerprovider(PlayerProvider):
@@ -134,17 +150,17 @@ class MyDemoPlayerprovider(PlayerProvider):
         # or any other logic that needs to run after the provider is fully loaded.
         # Initialize alexapy and login to Amazon account
         login: AlexaLogin = AlexaLogin(
-            url="amazon.com",
-            email="",
-            password="",
+            url=self.config.get_value(CONF_URL),
+            email=self.config.get_value(CONF_USERNAME),
+            password=self.config.get_value(CONF_PASSWORD),
             outputpath=lambda x: x,
         )
 
-        login._cookiefile = login._outputpath(
-            [
-                "/home/user/music-assistant_server/music_assistant/providers/alexa/alexa_media.<email>.pickle"
-            ]
-        )
+        login._cookiefile = [
+            login._outputpath(
+                f"/home/user/music-assistant_server/music_assistant/providers/alexa/alexa_media.{self.config.get_value(CONF_USERNAME)}.pickle"
+            ),
+        ]
 
         await login.login(cookies=await login.load_cookie())
 
