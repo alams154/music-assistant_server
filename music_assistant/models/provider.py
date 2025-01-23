@@ -58,11 +58,12 @@ class Provider:
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 
         Called when provider is deregistered (e.g. MA exiting or config reloading).
+        is_removed will be set to True when the provider is removed from the configuration.
         """
 
     async def on_mdns_service_state_change(

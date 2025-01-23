@@ -31,18 +31,14 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import (
-    MASS_LOGO,
-    SILENCE_FILE_LONG,
-    VARIOUS_ARTISTS_FANART,
-)
+from music_assistant.constants import MASS_LOGO, SILENCE_FILE_LONG, VARIOUS_ARTISTS_FANART
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
-    from music_assistant import MusicAssistant
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
 
@@ -160,7 +156,7 @@ class TestProvider(MusicProvider):
         artist_idx, album_idx, track_idx = prov_track_id.split("_", 3)
         return Track(
             item_id=prov_track_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=f"Test Track {artist_idx} - {album_idx} - {track_idx}",
             duration=60,
             artists=UniqueList([await self.get_artist(artist_idx)]),
@@ -181,7 +177,7 @@ class TestProvider(MusicProvider):
         """Get full artist details by id."""
         return Artist(
             item_id=prov_artist_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=f"Test Artist {prov_artist_id}",
             metadata=MediaItemMetadata(images=UniqueList([DEFAULT_THUMB, DEFAULT_FANART])),
             provider_mappings={
@@ -198,7 +194,7 @@ class TestProvider(MusicProvider):
         artist_idx, album_idx = prov_album_id.split("_", 2)
         return Album(
             item_id=prov_album_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=f"Test Album {album_idx}",
             artists=UniqueList([await self.get_artist(artist_idx)]),
             provider_mappings={
@@ -211,11 +207,11 @@ class TestProvider(MusicProvider):
             metadata=MediaItemMetadata(images=UniqueList([DEFAULT_THUMB])),
         )
 
-    async def get_podcast(self, prov_podcast_id: str) -> Album:
+    async def get_podcast(self, prov_podcast_id: str) -> Podcast:
         """Get full podcast details by id."""
         return Podcast(
             item_id=prov_podcast_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=f"Test Podcast {prov_podcast_id}",
             metadata=MediaItemMetadata(images=UniqueList([DEFAULT_THUMB])),
             provider_mappings={
@@ -232,7 +228,7 @@ class TestProvider(MusicProvider):
         """Get full audiobook details by id."""
         return Audiobook(
             item_id=prov_audiobook_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=f"Test Audiobook {prov_audiobook_id}",
             metadata=MediaItemMetadata(
                 images=UniqueList([DEFAULT_THUMB]),
@@ -259,13 +255,16 @@ class TestProvider(MusicProvider):
     async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
         """Retrieve library artists from the provider."""
         num_artists = self.config.get_value(CONF_KEY_NUM_ARTISTS)
+        assert isinstance(num_artists, int)
         for artist_idx in range(num_artists):
             yield await self.get_artist(str(artist_idx))
 
     async def get_library_albums(self) -> AsyncGenerator[Album, None]:
         """Retrieve library albums from the provider."""
         num_artists = self.config.get_value(CONF_KEY_NUM_ARTISTS) or 5
+        assert isinstance(num_artists, int)
         num_albums = self.config.get_value(CONF_KEY_NUM_ALBUMS)
+        assert isinstance(num_albums, int)
         for artist_idx in range(num_artists):
             for album_idx in range(num_albums):
                 album_item_id = f"{artist_idx}_{album_idx}"
@@ -274,8 +273,11 @@ class TestProvider(MusicProvider):
     async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
         """Retrieve library tracks from the provider."""
         num_artists = self.config.get_value(CONF_KEY_NUM_ARTISTS) or 5
+        assert isinstance(num_artists, int)
         num_albums = self.config.get_value(CONF_KEY_NUM_ALBUMS) or 5
+        assert isinstance(num_albums, int)
         num_tracks = self.config.get_value(CONF_KEY_NUM_TRACKS)
+        assert isinstance(num_tracks, int)
         for artist_idx in range(num_artists):
             for album_idx in range(num_albums):
                 for track_idx in range(num_tracks):
@@ -285,12 +287,14 @@ class TestProvider(MusicProvider):
     async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
         """Retrieve library tracks from the provider."""
         num_podcasts = self.config.get_value(CONF_KEY_NUM_PODCASTS)
+        assert isinstance(num_podcasts, int)
         for podcast_idx in range(num_podcasts):
             yield await self.get_podcast(str(podcast_idx))
 
     async def get_library_audiobooks(self) -> AsyncGenerator[Audiobook, None]:
         """Retrieve library audiobooks from the provider."""
         num_audiobooks = self.config.get_value(CONF_KEY_NUM_AUDIOBOOKS)
+        assert isinstance(num_audiobooks, int)
         for audiobook_idx in range(num_audiobooks):
             yield await self.get_audiobook(str(audiobook_idx))
 
@@ -310,12 +314,12 @@ class TestProvider(MusicProvider):
         podcast_id, episode_idx = prov_episode_id.split("_", 2)
         return PodcastEpisode(
             item_id=prov_episode_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=f"Test PodcastEpisode {podcast_id}-{episode_idx}",
             duration=60,
             podcast=ItemMapping(
                 item_id=podcast_id,
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 name=f"Test Podcast {podcast_id}",
                 media_type=MediaType.PODCAST,
                 image=DEFAULT_THUMB,
@@ -339,7 +343,7 @@ class TestProvider(MusicProvider):
     ) -> StreamDetails:
         """Get streamdetails for a track/radio."""
         return StreamDetails(
-            provider=self.instance_id,
+            provider=self.lookup_key,
             item_id=item_id,
             audio_format=AudioFormat(
                 content_type=ContentType.OGG,

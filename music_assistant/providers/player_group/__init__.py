@@ -36,7 +36,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
     UnsupportedFeaturedException,
 )
-from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.media_items import AudioFormat, UniqueList
 from music_assistant_models.player import DeviceInfo, Player, PlayerMedia
 
 from music_assistant.constants import (
@@ -53,9 +53,11 @@ from music_assistant.constants import (
     CONF_GROUP_MEMBERS,
     CONF_HTTP_PROFILE,
     CONF_SAMPLE_RATES,
+    DEFAULT_PCM_FORMAT,
     create_sample_rates_config_entry,
 )
 from music_assistant.controllers.streams import DEFAULT_STREAM_HEADERS
+from music_assistant.helpers.audio import get_player_filter_params
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.util import TaskManager
 from music_assistant.models.player_provider import PlayerProvider
@@ -74,9 +76,9 @@ if TYPE_CHECKING:
 
 
 UGP_FORMAT = AudioFormat(
-    content_type=ContentType.PCM_F32LE,
-    sample_rate=48000,
-    bit_depth=32,
+    content_type=DEFAULT_PCM_FORMAT.content_type,
+    sample_rate=DEFAULT_PCM_FORMAT.sample_rate,
+    bit_depth=DEFAULT_PCM_FORMAT.bit_depth,
 )
 
 # ruff: noqa: ARG002
@@ -202,7 +204,7 @@ class PlayerGroupProvider(PlayerProvider):
             self.mass.subscribe(self._on_mass_player_added_event, EventType.PLAYER_ADDED)
         )
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 
@@ -453,7 +455,9 @@ class PlayerGroupProvider(PlayerProvider):
             )
 
         # start the stream task
-        self.ugp_streams[player_id] = UGPStream(audio_source=audio_source, audio_format=UGP_FORMAT)
+        self.ugp_streams[player_id] = UGPStream(
+            audio_source=audio_source, audio_format=UGP_FORMAT, base_pcm_format=UGP_FORMAT
+        )
         base_url = f"{self.mass.streams.base_url}/ugp/{player_id}.mp3"
 
         # set the state optimistically
@@ -659,7 +663,10 @@ class PlayerGroupProvider(PlayerProvider):
         self, group_player_id: str, group_type: str, name: str, members: Iterable[str]
     ) -> Player:
         """Register a syncgroup player."""
-        player_features = {PlayerFeature.POWER, PlayerFeature.VOLUME_SET}
+        player_features = {
+            PlayerFeature.POWER,
+            PlayerFeature.VOLUME_SET,
+        }
 
         if not (self.mass.players.get(x) for x in members):
             raise PlayerUnavailableError("One or more members are not available!")
@@ -678,6 +685,7 @@ class PlayerGroupProvider(PlayerProvider):
                 for x in self.mass.players.providers
                 if x.instance_id != self.instance_id
             }
+            player_features.add(PlayerFeature.MULTI_DEVICE_DSP)
         elif player_provider := self.mass.get_provider(group_type):
             # grab additional details from one of the provider's players
             if TYPE_CHECKING:
@@ -711,7 +719,7 @@ class PlayerGroupProvider(PlayerProvider):
             needs_poll=True,
             poll_interval=30,
             can_group_with=can_group_with,
-            group_childs=set(members),
+            group_childs=UniqueList(members),
         )
 
         await self.mass.players.register_or_update(player)
@@ -825,6 +833,10 @@ class PlayerGroupProvider(PlayerProvider):
         ugp_player_id = request.path.rsplit(".")[0].rsplit("/")[-1]
         child_player_id = request.query.get("player_id")  # optional!
 
+        # Right now we default to MP3 output format, since it's the most compatible
+        # TODO: use the player's preferred output format
+        output_format = AudioFormat(content_type=ContentType.MP3)
+
         if not (ugp_player := self.mass.players.get(ugp_player_id)):
             raise web.HTTPNotFound(reason=f"Unknown UGP player: {ugp_player_id}")
 
@@ -860,7 +872,18 @@ class PlayerGroupProvider(PlayerProvider):
             ugp_player.display_name,
             child_player_id or request.remote,
         )
-        async for chunk in stream.subscribe():
+
+        # Generate filter params for the player specific DSP settings
+        filter_params = None
+        if child_player_id:
+            filter_params = get_player_filter_params(
+                self.mass, child_player_id, stream.input_format
+            )
+
+        async for chunk in stream.get_stream(
+            output_format,
+            filter_params=filter_params,
+        ):
             try:
                 await resp.write(chunk)
             except (ConnectionError, ConnectionResetError):

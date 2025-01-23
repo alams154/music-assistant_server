@@ -20,7 +20,7 @@ from .sonic_provider import (
 if TYPE_CHECKING:
     from music_assistant_models.provider import ProviderManifest
 
-    from music_assistant import MusicAssistant
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
 
@@ -58,7 +58,7 @@ async def get_config_entries(
             type=ConfigEntryType.STRING,
             label="Base URL",
             required=True,
-            description="Base URL for the server, e.g. " "https://subsonic.mydomain.tld",
+            description="Base URL for the server, e.g. https://subsonic.mydomain.tld",
         ),
         ConfigEntry(
             key=CONF_PORT,

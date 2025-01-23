@@ -40,7 +40,7 @@ from music_assistant_models.media_items import (
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import MASS_LOGO, VARIOUS_ARTISTS_FANART
-from music_assistant.helpers.tags import AudioTags, parse_tags
+from music_assistant.helpers.tags import AudioTags, async_parse_tags
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.models.music_provider import MusicProvider
 
@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
-    from music_assistant import MusicAssistant
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
 
@@ -533,7 +533,7 @@ class BuiltinProvider(MusicProvider):
         if cached_info and not force_refresh:
             return AudioTags.parse(cached_info)
         # parse info with ffprobe (and store in cache)
-        media_info = await parse_tags(url)
+        media_info = await async_parse_tags(url)
         if "authSig" in url:
             media_info.has_cover_image = False
         await self.mass.cache.set(
@@ -617,8 +617,23 @@ class BuiltinProvider(MusicProvider):
     async def _get_builtin_playlist_recently_played(self) -> list[Track]:
         result: list[Track] = []
         recent_tracks = await self.mass.music.recently_played(100, [MediaType.TRACK])
-        for idx, track in enumerate(recent_tracks, 1):
-            assert isinstance(track, Track)
+        for idx, item in enumerate(recent_tracks, 1):
+            if not (item_provider := self.mass.get_provider(item.provider)):
+                continue
+            track = Track(
+                item_id=item.item_id,
+                provider=item.provider,
+                name=item.name,
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=item.item_id,
+                        provider_domain=item_provider.domain,
+                        provider_instance=item_provider.instance_id,
+                    )
+                },
+            )
+            if item.image:
+                track.metadata.add_image(item.image)
             track.position = idx
             result.append(track)
         return result

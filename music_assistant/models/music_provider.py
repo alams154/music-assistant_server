@@ -63,7 +63,6 @@ class MusicProvider(Provider):
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
-        self.mass.music.start_sync(providers=[self.instance_id])
 
     async def search(
         self,
@@ -332,10 +331,38 @@ class MusicProvider(Provider):
     async def on_streamed(
         self,
         streamdetails: StreamDetails,
-        seconds_streamed: int,
-        fully_played: bool = False,
     ) -> None:
-        """Handle callback when an item completed streaming."""
+        """
+        Handle callback when given streamdetails completed streaming.
+
+        To get the number of seconds streamed, see streamdetails.seconds_streamed.
+        To get the number of seconds seeked/skipped, see streamdetails.seek_position.
+        Note that seconds_streamed is the total streamed seconds, so without seeked time.
+
+        NOTE: Due to internal and player buffering,
+        this may be called in advance of the actual completion.
+        """
+
+    async def on_played(
+        self,
+        media_type: MediaType,
+        item_id: str,
+        fully_played: bool,
+        position: int,
+    ) -> None:
+        """
+        Handle callback when a (playable) media item has been played.
+
+        This is called by the Queue controller when;
+            - a track has been fully played
+            - a track has been skipped
+            - a track has been stopped after being played
+
+        Fully played is True when the track has been played to the end.
+        Position is the last known position of the track in seconds, to sync resume state.
+        When fully_played is set to false and position is 0,
+        the user marked the item as unplayed in the UI.
+        """
 
     async def resolve_image(self, path: str) -> str | bytes:
         """
@@ -594,8 +621,28 @@ class MusicProvider(Provider):
                         library_item = await controller.update_item_in_library(
                             library_item.item_id, prov_item
                         )
-                    elif library_item.available != prov_item.available:
+                    if library_item.available != prov_item.available:
                         # existing item availability changed
+                        library_item = await controller.update_item_in_library(
+                            library_item.item_id, prov_item
+                        )
+                    if (
+                        getattr(library_item, "resume_position_ms", None)
+                        != (resume_pos_prov := getattr(prov_item, "resume_position_ms", None))
+                        and resume_pos_prov is not None
+                    ):
+                        # resume_position_ms changed (audiobook only)
+                        library_item.resume_position_ms = resume_pos_prov
+                        library_item = await controller.update_item_in_library(
+                            library_item.item_id, prov_item
+                        )
+                    if (
+                        getattr(library_item, "fully_played", None)
+                        != (fully_played_prov := getattr(prov_item, "fully_played", None))
+                        and fully_played_prov is not None
+                    ):
+                        # fully_played changed (audiobook only)
+                        library_item.fully_played = fully_played_prov
                         library_item = await controller.update_item_in_library(
                             library_item.item_id, prov_item
                         )
@@ -628,17 +675,23 @@ class MusicProvider(Provider):
                             for x in item.provider_mappings
                             if x.provider_domain != self.domain
                         }
-                        if not remaining_providers and media_type != MediaType.ARTIST:
-                            # this item is removed from the provider's library
-                            # and we have no other providers attached to it
-                            # it is safe to remove it from the MA library too
-                            # note we skip artists here to prevent a recursive removal
-                            # of all albums and tracks underneath this artist
-                            await controller.remove_item_from_library(db_id)
-                        else:
-                            # otherwise: just unmark favorite
+                        if remaining_providers:
+                            continue
+                        # this item is removed from the provider's library
+                        # and we have no other providers attached to it
+                        # it is safe to remove it from the MA library too
+                        # note that we do not remove item's recursively on purpose
+                        try:
+                            await controller.remove_item_from_library(db_id, recursive=False)
+                        except MusicAssistantError as err:
+                            # this is probably because the item still has dependents
+                            self.logger.warning(
+                                "Error removing item %s from library: %s", db_id, str(err)
+                            )
+                            # just un-favorite the item if we can't remove it
                             await controller.set_favorite(db_id, False)
-                await asyncio.sleep(0)  # yield to eventloop
+                        await asyncio.sleep(0)  # yield to eventloop
+
             await self.mass.cache.set(
                 media_type.value,
                 list(cur_db_ids),

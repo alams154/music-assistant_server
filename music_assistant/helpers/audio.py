@@ -14,19 +14,22 @@ from typing import TYPE_CHECKING
 
 import aiofiles
 from aiohttp import ClientTimeout
+from music_assistant_models.dsp import DSPConfig, DSPDetails, DSPState
 from music_assistant_models.enums import (
     ContentType,
     MediaType,
+    PlayerFeature,
+    PlayerType,
     StreamType,
     VolumeNormalizationMode,
 )
 from music_assistant_models.errors import (
+    AudioError,
     InvalidDataError,
     MediaNotFoundError,
     MusicAssistantError,
     ProviderUnavailableError,
 )
-from music_assistant_models.helpers import set_global_cache_values
 from music_assistant_models.streamdetails import AudioFormat
 
 from music_assistant.constants import (
@@ -44,11 +47,12 @@ from music_assistant.helpers.util import clean_stream_title
 from .dsp import filter_to_ffmpeg_params
 from .ffmpeg import FFMpeg, get_ffmpeg_stream
 from .playlists import IsHLSPlaylist, PlaylistItem, fetch_playlist, parse_m3u
-from .process import AsyncProcess, check_output, communicate
-from .util import TimedAsyncGenerator, create_tempfile, detect_charset
+from .process import AsyncProcess, communicate
+from .util import create_tempfile, detect_charset
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import CoreConfig, PlayerConfig
+    from music_assistant_models.player import Player
     from music_assistant_models.player_queue import QueueItem
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -123,7 +127,7 @@ async def crossfade_pcm_parts(
         return crossfaded_audio
     # no crossfade_data, return original data instead
     LOGGER.debug(
-        "crossfade of pcm chunks failed: not enough data? " "fade_in_part: %s - fade_out_part: %s",
+        "crossfade of pcm chunks failed: not enough data? - fade_in_part: %s - fade_out_part: %s",
         len(fade_in_part),
         len(fade_out_part),
     )
@@ -178,6 +182,63 @@ async def strip_silence(
             bytes_stripped,
         )
     return stripped_data
+
+
+def get_player_dsp_details(
+    mass: MusicAssistant, player: Player, group_preventing_dsp=False
+) -> DSPDetails:
+    """Return DSP details of single a player.
+
+    This will however not check if the queried player is part of a group.
+    The caller is responsible for passing the result of is_grouping_preventing_dsp of
+    the leader/PlayerGroup as the group_preventing_dsp argument in such cases.
+    """
+    dsp_config = mass.config.get_player_dsp_config(player.player_id)
+    dsp_state = DSPState.ENABLED if dsp_config.enabled else DSPState.DISABLED
+    if dsp_state == DSPState.ENABLED and (
+        group_preventing_dsp or is_grouping_preventing_dsp(player)
+    ):
+        dsp_state = DSPState.DISABLED_BY_UNSUPPORTED_GROUP
+        dsp_config = DSPConfig(enabled=False)
+
+    # remove disabled filters
+    dsp_config.filters = [x for x in dsp_config.filters if x.enabled]
+
+    return DSPDetails(
+        state=dsp_state,
+        input_gain=dsp_config.input_gain,
+        filters=dsp_config.filters,
+        output_gain=dsp_config.output_gain,
+        output_limiter=dsp_config.output_limiter,
+    )
+
+
+def get_stream_dsp_details(
+    mass: MusicAssistant,
+    queue_id: str,
+) -> dict[str, DSPDetails]:
+    """Return DSP details of all players playing this queue, keyed by player_id."""
+    player = mass.players.get(queue_id)
+    dsp = {}
+    group_preventing_dsp: bool = False
+
+    # We skip the PlayerGroups as they don't provide an audio output
+    # by themselves, but only sync other players.
+    if not player.provider.startswith("player_group"):
+        details = get_player_dsp_details(mass, player)
+        details.is_leader = True
+        dsp[player.player_id] = details
+    else:
+        group_preventing_dsp = is_grouping_preventing_dsp(player)
+
+    if player and player.group_childs:
+        # grouped playback, get DSP details for each player in the group
+        for child_id in player.group_childs:
+            if child_player := mass.players.get(child_id):
+                dsp[child_id] = get_player_dsp_details(
+                    mass, child_player, group_preventing_dsp=group_preventing_dsp
+                )
+    return dsp
 
 
 async def get_stream_details(
@@ -262,10 +323,13 @@ async def get_stream_details(
     streamdetails.prefer_album_loudness = prefer_album_loudness
     player_settings = await mass.config.get_player_config(streamdetails.queue_id)
     core_config = await mass.config.get_core_config("streams")
+    streamdetails.target_loudness = player_settings.get_value(CONF_VOLUME_NORMALIZATION_TARGET)
     streamdetails.volume_normalization_mode = _get_normalization_mode(
         core_config, player_settings, streamdetails
     )
-    streamdetails.target_loudness = player_settings.get_value(CONF_VOLUME_NORMALIZATION_TARGET)
+
+    # attach the DSP details of all group members
+    streamdetails.dsp = get_stream_dsp_details(mass, streamdetails.queue_id)
 
     process_time = int((time.time() - time_start) * 1000)
     LOGGER.debug(
@@ -286,7 +350,7 @@ async def get_media_stream(
 ) -> AsyncGenerator[bytes, None]:
     """Get PCM audio stream for given media details."""
     logger = LOGGER.getChild("media_stream")
-    logger.debug("start media stream for: %s", streamdetails.uri)
+    logger.log(VERBOSE_LOG_LEVEL, "Starting media stream for %s", streamdetails.uri)
     strip_silence_begin = streamdetails.strip_silence_begin
     strip_silence_end = streamdetails.strip_silence_end
     if streamdetails.fade_in:
@@ -296,7 +360,7 @@ async def get_media_stream(
     chunk_number = 0
     buffer: bytes = b""
     finished = False
-
+    cancelled = False
     ffmpeg_proc = FFMpeg(
         audio_input=audio_source,
         input_format=streamdetails.audio_format,
@@ -304,14 +368,25 @@ async def get_media_stream(
         filter_params=filter_params,
         extra_input_args=extra_input_args,
         collect_log_history=True,
+        loglevel="debug" if LOGGER.isEnabledFor(VERBOSE_LOG_LEVEL) else "info",
     )
     try:
         await ffmpeg_proc.start()
-        async for chunk in TimedAsyncGenerator(
-            ffmpeg_proc.iter_chunked(pcm_format.pcm_sample_size), 300
-        ):
-            # for radio streams we just yield all chunks directly
-            if streamdetails.media_type == MediaType.RADIO:
+        logger.debug(
+            "Started media stream for %s"
+            " - using streamtype: %s"
+            " - volume normalization: %s"
+            " - pcm format: %s"
+            " - ffmpeg PID: %s",
+            streamdetails.uri,
+            streamdetails.stream_type,
+            streamdetails.volume_normalization_mode,
+            pcm_format.content_type.value,
+            ffmpeg_proc.proc.pid,
+        )
+        async for chunk in ffmpeg_proc.iter_chunked(pcm_format.pcm_sample_size):
+            # for non-tracks we just yield all chunks directly
+            if streamdetails.media_type != MediaType.TRACK:
                 yield chunk
                 bytes_sent += len(chunk)
                 continue
@@ -350,6 +425,11 @@ async def get_media_stream(
                 buffer = buffer[pcm_format.pcm_sample_size :]
 
         # end of audio/track reached
+        if bytes_sent == 0:
+            # edge case: no audio data was sent
+            raise AudioError("No audio was received")
+
+        logger.log(VERBOSE_LOG_LEVEL, "End of stream reached.")
         if strip_silence_end and buffer:
             # strip silence from end of audio
             buffer = await strip_silence(
@@ -362,41 +442,51 @@ async def get_media_stream(
         bytes_sent += len(buffer)
         yield buffer
         del buffer
+        # wait until stderr also completed reading
+        await ffmpeg_proc.wait_with_timeout(5)
         finished = True
-
+    except (Exception, GeneratorExit) as err:
+        if isinstance(err, asyncio.CancelledError | GeneratorExit):
+            # we were cancelled, just raise
+            cancelled = True
+            raise
+        logger.error("Error while streaming %s: %s", streamdetails.uri, err)
+        streamdetails.stream_error = True
     finally:
+        # always ensure close is called which also handles all cleanup
         await ffmpeg_proc.close()
 
-        if bytes_sent == 0:
-            # edge case: no audio data was sent
-            streamdetails.stream_error = True
-            seconds_streamed = 0
-            logger.warning("Stream error on %s", streamdetails.uri)
+        # try to determine how many seconds we've streamed
+        seconds_streamed = bytes_sent / pcm_format.pcm_sample_size if bytes_sent else 0
+        if not cancelled and ffmpeg_proc.returncode != 0:
+            # dump the last 5 lines of the log in case of an unclean exit
+            log_tail = "\n" + "\n".join(list(ffmpeg_proc.log_history)[-5:])
         else:
-            # try to determine how many seconds we've streamed
-            seconds_streamed = bytes_sent / pcm_format.pcm_sample_size if bytes_sent else 0
-            logger.debug(
-                "stream %s (with code %s) for %s - seconds streamed: %s",
-                "finished" if finished else "aborted",
-                ffmpeg_proc.returncode,
-                streamdetails.uri,
-                seconds_streamed,
-            )
+            log_tail = ""
+        logger.debug(
+            "stream %s (with code %s) for %s - seconds streamed: %s %s",
+            "cancelled" if cancelled else "finished" if finished else "aborted",
+            ffmpeg_proc.returncode,
+            streamdetails.uri,
+            seconds_streamed,
+            log_tail,
+        )
 
         streamdetails.seconds_streamed = seconds_streamed
         # store accurate duration
         if finished and not streamdetails.seek_position and seconds_streamed:
             streamdetails.duration = seconds_streamed
 
-        # parse loudnorm data if we have that collected
+        # parse loudnorm data if we have that collected (and enabled)
         if (
-            streamdetails.loudness is None
-            and streamdetails.volume_normalization_mode != VolumeNormalizationMode.DISABLED
+            (streamdetails.loudness is None or finished)
+            and streamdetails.volume_normalization_mode == VolumeNormalizationMode.DYNAMIC
             and (finished or (seconds_streamed >= 300))
         ):
             # if dynamic volume normalization is enabled and the entire track is streamed
-            # the loudnorm filter will output the measuremeet in the log,
+            # the loudnorm filter will output the measurement in the log,
             # so we can use those directly instead of analyzing the audio
+            logger.log(VERBOSE_LOG_LEVEL, "Collecting loudness measurement...")
             if loudness_details := parse_loudnorm(" ".join(ffmpeg_proc.log_history)):
                 logger.debug(
                     "Loudness measurement for %s: %s dB",
@@ -412,11 +502,26 @@ async def get_media_stream(
                         media_type=streamdetails.media_type,
                     )
                 )
-            else:
-                # no data from loudnorm filter found, we need to analyze the audio
-                # add background task to start analyzing the audio
-                task_id = f"analyze_loudness_{streamdetails.uri}"
-                mass.create_task(analyze_loudness, mass, streamdetails, task_id=task_id)
+        elif (
+            streamdetails.loudness is None
+            and streamdetails.volume_normalization_mode
+            not in (
+                VolumeNormalizationMode.DISABLED,
+                VolumeNormalizationMode.FIXED_GAIN,
+            )
+            and (finished or (seconds_streamed >= 30))
+            and streamdetails.media_type != MediaType.PLUGIN_SOURCE
+        ):
+            # dynamic mode not allowed and no measurement known, we need to analyze the audio
+            # add background task to start analyzing the audio
+            task_id = f"analyze_loudness_{streamdetails.uri}"
+            mass.call_later(5, analyze_loudness, mass, streamdetails, task_id=task_id)
+
+        # report stream to provider
+        if (finished or seconds_streamed >= 30) and (
+            music_prov := mass.get_provider(streamdetails.provider)
+        ):
+            mass.create_task(music_prov.on_streamed(streamdetails))
 
 
 def create_wave_header(samplerate=44100, channels=2, bitspersample=16, duration=None):
@@ -728,21 +833,6 @@ async def get_file_stream(
             yield data
 
 
-async def check_audio_support() -> tuple[bool, bool, str]:
-    """Check if ffmpeg is present (with/without libsoxr support)."""
-    # check for FFmpeg presence
-    returncode, output = await check_output("ffmpeg", "-version")
-    ffmpeg_present = returncode == 0 and "FFmpeg" in output.decode()
-
-    # use globals as in-memory cache
-    version = output.decode().split("ffmpeg version ")[1].split(" ")[0].split("-")[0]
-    libsoxr_support = "enable-libsoxr" in output.decode()
-    result = (ffmpeg_present, libsoxr_support, version)
-    # store in global cache for easy access by 'get_ffmpeg_args'
-    await set_global_cache_values({"ffmpeg_support": result})
-    return result
-
-
 async def get_preview_stream(
     mass: MusicAssistant,
     provider_instance_id_or_domain: str,
@@ -828,6 +918,30 @@ def get_chunksize(
     return int((320000 / 8) * seconds)
 
 
+def is_grouping_preventing_dsp(player: Player) -> bool:
+    """Check if grouping is preventing DSP from being applied to this leader/PlayerGroup.
+
+    If this returns True, no DSP should be applied to the player.
+    This function will not check if the Player is in a group, the caller should do that first.
+    """
+    # We require the caller to handle non-leader cases themselves since player.synced_to
+    # can be unreliable in some edge cases
+    multi_device_dsp_supported = PlayerFeature.MULTI_DEVICE_DSP in player.supported_features
+    child_count = len(player.group_childs) if player.group_childs else 0
+
+    is_multiple_devices: bool
+    if player.provider.startswith("player_group"):
+        # PlayerGroups have no leader, so having a child count of 1 means
+        # the group actually contains only a single player.
+        is_multiple_devices = child_count > 1
+    elif player.type == PlayerType.GROUP:
+        # This is an group player external to Music Assistant.
+        is_multiple_devices = True
+    else:
+        is_multiple_devices = child_count > 0
+    return is_multiple_devices and not multi_device_dsp_supported
+
+
 def get_player_filter_params(
     mass: MusicAssistant,
     player_id: str,
@@ -837,6 +951,25 @@ def get_player_filter_params(
     filter_params = []
 
     dsp = mass.config.get_player_dsp_config(player_id)
+
+    if player := mass.players.get(player_id):
+        if is_grouping_preventing_dsp(player):
+            # We can not correctly apply DSP to a grouped player without multi-device DSP support,
+            # so we disable it.
+            dsp.enabled = False
+        elif player.provider.startswith("player_group") and (
+            PlayerFeature.MULTI_DEVICE_DSP not in player.supported_features
+        ):
+            # This is a special case! We have a player group where:
+            # - The group leader does not support MULTI_DEVICE_DSP
+            # - But only contains a single player (since nothing is preventing DSP)
+            # We can still apply the DSP of that single player.
+            if player.group_childs:
+                child_player = mass.players.get(player.group_childs[0])
+                dsp = mass.config.get_player_dsp_config(child_player)
+            else:
+                # This should normally never happen, but if it does, we disable DSP.
+                dsp.enabled = False
 
     if dsp.enabled:
         # Apply input gain
@@ -876,16 +1009,16 @@ def get_player_filter_params(
 def parse_loudnorm(raw_stderr: bytes | str) -> float | None:
     """Parse Loudness measurement from ffmpeg stderr output."""
     stderr_data = raw_stderr.decode() if isinstance(raw_stderr, bytes) else raw_stderr
-    if "[Parsed_loudnorm_" not in stderr_data:
+    if "[Parsed_loudnorm_0 @" not in stderr_data:
         return None
-    stderr_data = stderr_data.split("[Parsed_loudnorm_")[1]
-    stderr_data = "{" + stderr_data.rsplit("{")[-1].strip()
-    stderr_data = stderr_data.rsplit("}")[0].strip() + "}"
-    try:
-        loudness_data = json_loads(stderr_data)
-    except JSON_DECODE_EXCEPTIONS:
-        return None
-    return float(loudness_data["input_i"])
+    for jsun_chunk in stderr_data.split(" { "):
+        try:
+            stderr_data = "{" + jsun_chunk.rsplit("}")[0].strip() + "}"
+            loudness_data = json_loads(stderr_data)
+            return float(loudness_data["input_i"])
+        except (*JSON_DECODE_EXCEPTIONS, KeyError, ValueError, IndexError):
+            continue
+    return None
 
 
 async def analyze_loudness(
@@ -932,6 +1065,7 @@ async def analyze_loudness(
         filter_params=["ebur128=framelog=verbose"],
         extra_input_args=extra_input_args,
         collect_log_history=True,
+        loglevel="info",
     ) as ffmpeg_proc:
         await ffmpeg_proc.wait()
         log_lines = ffmpeg_proc.log_history
@@ -968,6 +1102,9 @@ def _get_normalization_mode(
     if not player_config.get_value(CONF_VOLUME_NORMALIZATION):
         # disabled for this player
         return VolumeNormalizationMode.DISABLED
+    if streamdetails.target_loudness is None:
+        # no target loudness set, disable normalization
+        return VolumeNormalizationMode.DISABLED
     # work out preference for track or radio
     preference = VolumeNormalizationMode(
         core_config.get_value(
@@ -988,6 +1125,14 @@ def _get_normalization_mode(
     # handle no measurement available and fallback to fixed gain is allowed
     if streamdetails.loudness is None and preference == VolumeNormalizationMode.FALLBACK_FIXED_GAIN:
         return VolumeNormalizationMode.FIXED_GAIN
+
+    # handle measurement available - chosen mode is measurement
+    if streamdetails.loudness and preference not in (
+        VolumeNormalizationMode.DISABLED,
+        VolumeNormalizationMode.FIXED_GAIN,
+        VolumeNormalizationMode.DYNAMIC,
+    ):
+        return VolumeNormalizationMode.MEASUREMENT_ONLY
 
     # simply return the preference
     return preference

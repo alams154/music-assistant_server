@@ -668,7 +668,7 @@ class MetaDataController(CoreController):
         # fanart image
         fanart_image = next((x for x in cur_images if x.type == ImageType.FANART), None)
         if not fanart_image or self._collage_images_dir in fanart_image.path:
-            img_filename = thumb_image.path if thumb_image else f"{uuid4().hex}_fanart.jpg"
+            img_filename = fanart_image.path if fanart_image else f"{uuid4().hex}_fanart.jpg"
             if collage_fanart_image := await self.create_collage_image(
                 all_playlist_tracks_images, img_filename, fanart=True
             ):
@@ -742,6 +742,8 @@ class MetaDataController(CoreController):
 
     async def _process_metadata_lookup_jobs(self) -> None:
         """Task to process metadata lookup jobs."""
+        # postpone the lookup for a while to allow the system to start up and providers initialized
+        await asyncio.sleep(60)
         while True:
             item_uri = await self._lookup_jobs.get()
             try:

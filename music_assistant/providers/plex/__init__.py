@@ -55,7 +55,7 @@ from plexapi.server import PlexServer
 
 from music_assistant.constants import UNKNOWN_ARTIST
 from music_assistant.helpers.auth import AuthenticationHelper
-from music_assistant.helpers.tags import parse_tags
+from music_assistant.helpers.tags import async_parse_tags
 from music_assistant.helpers.util import parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.providers.plex.helpers import discover_local_servers, get_libraries
@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from plexapi.media import Media as PlexMedia
     from plexapi.media import MediaPart as PlexMediaPart
 
-    from music_assistant import MusicAssistant
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
 CONF_ACTION_AUTH_MYPLEX = "auth_myplex"
@@ -433,14 +433,14 @@ class PlexProvider(MusicProvider):
         return ItemMapping(
             media_type=media_type,
             item_id=key,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=name,
             version=version,
         )
 
     async def _get_or_create_artist_by_name(self, artist_name: str) -> Artist | ItemMapping:
         if library_items := await self.mass.music.artists._get_library_items_by_query(
-            search=artist_name, provider=self.instance_id
+            search=artist_name, provider=self.lookup_key
         ):
             return ItemMapping.from_item(library_items[0])
 
@@ -448,7 +448,7 @@ class PlexProvider(MusicProvider):
         return Artist(
             item_id=artist_id,
             name=artist_name or UNKNOWN_ARTIST,
-            provider=self.domain,
+            provider=self.lookup_key,
             provider_mappings={
                 ProviderMapping(
                     item_id=str(artist_id),
@@ -540,7 +540,7 @@ class PlexProvider(MusicProvider):
         album_id = plex_album.key
         album = Album(
             item_id=album_id,
-            provider=self.domain,
+            provider=self.lookup_key,
             name=plex_album.title or "[Unknown]",
             provider_mappings={
                 ProviderMapping(
@@ -566,7 +566,7 @@ class PlexProvider(MusicProvider):
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=thumb,
-                        provider=self.instance_id,
+                        provider=self.lookup_key,
                         remotely_accessible=False,
                     )
                 ]
@@ -592,7 +592,7 @@ class PlexProvider(MusicProvider):
         artist = Artist(
             item_id=artist_id,
             name=plex_artist.title or UNKNOWN_ARTIST,
-            provider=self.domain,
+            provider=self.lookup_key,
             provider_mappings={
                 ProviderMapping(
                     item_id=str(artist_id),
@@ -610,7 +610,7 @@ class PlexProvider(MusicProvider):
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=thumb,
-                        provider=self.instance_id,
+                        provider=self.lookup_key,
                         remotely_accessible=False,
                     )
                 ]
@@ -621,7 +621,7 @@ class PlexProvider(MusicProvider):
         """Parse a Plex Playlist response to a Playlist object."""
         playlist = Playlist(
             item_id=plex_playlist.key,
-            provider=self.domain,
+            provider=self.lookup_key,
             name=plex_playlist.title or "[Unknown]",
             provider_mappings={
                 ProviderMapping(
@@ -640,7 +640,7 @@ class PlexProvider(MusicProvider):
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=thumb,
-                        provider=self.instance_id,
+                        provider=self.lookup_key,
                         remotely_accessible=False,
                     )
                 ]
@@ -660,7 +660,7 @@ class PlexProvider(MusicProvider):
             content = None
         track = Track(
             item_id=plex_track.key,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             name=plex_track.title or "[Unknown]",
             provider_mappings={
                 ProviderMapping(
@@ -711,7 +711,7 @@ class PlexProvider(MusicProvider):
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=thumb,
-                        provider=self.instance_id,
+                        provider=self.lookup_key,
                         remotely_accessible=False,
                     )
                 ]
@@ -901,7 +901,7 @@ class PlexProvider(MusicProvider):
 
         media: PlexMedia = plex_track.media[0]
 
-        media_type = (
+        content_type = (
             ContentType.try_parse(media.container) if media.container else ContentType.UNKNOWN
         )
         media_part: PlexMediaPart = media.parts[0]
@@ -909,9 +909,9 @@ class PlexProvider(MusicProvider):
 
         stream_details = StreamDetails(
             item_id=plex_track.key,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
-                content_type=media_type,
+                content_type=content_type,
                 channels=media.audioChannels,
             ),
             stream_type=StreamType.HTTP,
@@ -919,7 +919,7 @@ class PlexProvider(MusicProvider):
             data=plex_track,
         )
 
-        if media_type != ContentType.M4A:
+        if content_type != ContentType.M4A:
             stream_details.path = self._plex_server.url(media_part.key, True)
             if audio_stream.samplingRate:
                 stream_details.audio_format.sample_rate = audio_stream.samplingRate
@@ -928,7 +928,7 @@ class PlexProvider(MusicProvider):
 
         else:
             url = plex_track.getStreamURL()
-            media_info = await parse_tags(url)
+            media_info = await async_parse_tags(url)
             stream_details.path = url
             stream_details.audio_format.channels = media_info.channels
             stream_details.audio_format.content_type = ContentType.try_parse(media_info.format)
@@ -940,8 +940,6 @@ class PlexProvider(MusicProvider):
     async def on_streamed(
         self,
         streamdetails: StreamDetails,
-        seconds_streamed: int,
-        fully_played: bool = False,
     ) -> None:
         """Handle callback when an item completed streaming."""
 

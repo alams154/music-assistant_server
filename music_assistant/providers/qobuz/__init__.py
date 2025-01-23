@@ -47,10 +47,7 @@ from music_assistant.constants import (
 )
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.json import json_loads
-from music_assistant.helpers.throttle_retry import (
-    ThrottlerManager,
-    throttle_with_retries,
-)
+from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
 from music_assistant.helpers.util import lock, parse_title_and_version, try_parse_int
 from music_assistant.models.music_provider import MusicProvider
 
@@ -435,7 +432,7 @@ class QobuzProvider(MusicProvider):
         self.mass.create_task(self._report_playback_started(streamdata))
         return StreamDetails(
             item_id=str(item_id),
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
                 content_type=content_type,
                 sample_rate=int(streamdata["sampling_rate"] * 1000),
@@ -479,8 +476,6 @@ class QobuzProvider(MusicProvider):
     async def on_streamed(
         self,
         streamdetails: StreamDetails,
-        seconds_streamed: int,
-        fully_played: bool = False,
     ) -> None:
         """Handle callback when an item completed streaming."""
         user_id = self._user_auth_info["user"]["id"]
@@ -489,7 +484,7 @@ class QobuzProvider(MusicProvider):
                 "/track/reportStreamingEnd",
                 user_id=user_id,
                 track_id=str(streamdetails.item_id),
-                duration=try_parse_int(seconds_streamed),
+                duration=try_parse_int(streamdetails.seconds_streamed),
             )
 
     def _parse_artist(self, artist_obj: dict):
@@ -503,7 +498,7 @@ class QobuzProvider(MusicProvider):
                     item_id=str(artist_obj["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
-                    url=f'https://open.qobuz.com/artist/{artist_obj["id"]}',
+                    url=f"https://open.qobuz.com/artist/{artist_obj['id']}",
                 )
             },
         )
@@ -545,7 +540,7 @@ class QobuzProvider(MusicProvider):
                         sample_rate=album_obj["maximum_sampling_rate"] * 1000,
                         bit_depth=album_obj["maximum_bit_depth"],
                     ),
-                    url=f'https://open.qobuz.com/album/{album_obj["id"]}',
+                    url=f"https://open.qobuz.com/album/{album_obj['id']}",
                 )
             },
         )
@@ -609,7 +604,7 @@ class QobuzProvider(MusicProvider):
                         sample_rate=track_obj["maximum_sampling_rate"] * 1000,
                         bit_depth=track_obj["maximum_bit_depth"],
                     ),
-                    url=f'https://open.qobuz.com/track/{track_obj["id"]}',
+                    url=f"https://open.qobuz.com/track/{track_obj['id']}",
                 )
             },
             disc_number=track_obj.get("media_number", 0),
@@ -675,9 +670,13 @@ class QobuzProvider(MusicProvider):
 
     def _parse_playlist(self, playlist_obj):
         """Parse qobuz playlist object to generic layout."""
+        is_editable = (
+            playlist_obj["owner"]["id"] == self._user_auth_info["user"]["id"]
+            or playlist_obj["is_collaborative"]
+        )
         playlist = Playlist(
             item_id=str(playlist_obj["id"]),
-            provider=self.domain,
+            provider=self.instance_id if is_editable else self.lookup_key,
             name=playlist_obj["name"],
             owner=playlist_obj["owner"]["name"],
             provider_mappings={
@@ -685,13 +684,10 @@ class QobuzProvider(MusicProvider):
                     item_id=str(playlist_obj["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
-                    url=f'https://open.qobuz.com/playlist/{playlist_obj["id"]}',
+                    url=f"https://open.qobuz.com/playlist/{playlist_obj['id']}",
                 )
             },
-        )
-        playlist.is_editable = (
-            playlist_obj["owner"]["id"] == self._user_auth_info["user"]["id"]
-            or playlist_obj["is_collaborative"]
+            is_editable=is_editable,
         )
         if img := self.__get_image(playlist_obj):
             playlist.metadata.images = [

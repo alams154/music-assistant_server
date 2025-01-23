@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
-    from music_assistant import MusicAssistant
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
 DOMAIN = "hass"
@@ -66,9 +66,9 @@ async def get_config_entries(
     values: the (intermediate) raw values for config entries sent with the action.
     """
     # config flow auth action/step (authenticate button clicked)
-    if action == CONF_ACTION_AUTH:
+    if action == CONF_ACTION_AUTH and values:
         hass_url = values[CONF_URL]
-        async with AuthenticationHelper(mass, values["session_id"]) as auth_helper:
+        async with AuthenticationHelper(mass, str(values["session_id"])) as auth_helper:
             client_id = base_url(auth_helper.callback_url)
             auth_url = get_auth_url(
                 hass_url,
@@ -170,7 +170,7 @@ class HomeAssistant(PluginProvider):
     """Home Assistant Plugin for Music Assistant."""
 
     hass: HomeAssistantClient
-    _listen_task: asyncio.Task | None = None
+    _listen_task: asyncio.Task[None] | None = None
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the plugin."""
@@ -185,7 +185,7 @@ class HomeAssistant(PluginProvider):
             raise SetupFailedError(err_msg) from err
         self._listen_task = self.mass.create_task(self._hass_listener())
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 

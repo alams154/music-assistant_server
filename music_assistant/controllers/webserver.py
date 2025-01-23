@@ -260,7 +260,7 @@ class WebsocketClientHandler:
 
         self._logger.log(VERBOSE_LOG_LEVEL, "Connection from %s", request.remote)
         self._handle_task = asyncio.current_task()
-        self._writer_task = asyncio.create_task(self._writer())
+        self._writer_task = self.mass.create_task(self._writer())
 
         # send server(version) info when client connects
         self._send_message(self.mass.get_server_info())
@@ -340,7 +340,7 @@ class WebsocketClientHandler:
             return
 
         # schedule task to handle the command
-        asyncio.create_task(self._run_handler(handler, msg))
+        self.mass.create_task(self._run_handler(handler, msg))
 
     async def _run_handler(self, handler: APICommandHandler, msg: CommandMessage) -> None:
         try:

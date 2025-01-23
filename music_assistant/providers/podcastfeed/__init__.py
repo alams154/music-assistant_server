@@ -27,6 +27,7 @@ from music_assistant_models.errors import InvalidProviderURI, MediaNotFoundError
 from music_assistant_models.media_items import (
     AudioFormat,
     ItemMapping,
+    MediaItemChapter,
     MediaItemImage,
     Podcast,
     PodcastEpisode,
@@ -34,6 +35,7 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.helpers.compare import create_safe_string
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -84,6 +86,8 @@ async def get_config_entries(
 class PodcastMusicprovider(MusicProvider):
     """Podcast RSS Feed Music Provider."""
 
+    parsed: dict | None = None
+
     @property
     def supported_features(self) -> set[ProviderFeature]:
         """Return the features supported by this Provider."""
@@ -96,7 +100,7 @@ class PodcastMusicprovider(MusicProvider):
         """Handle async initialization of the provider."""
         # ruff: noqa: S310
         feed_url = podcastparser.normalize_feed_url(self.config.get_value(CONF_FEED_URL))
-        self.podcast_id = str(hash(feed_url))
+        self.podcast_id = create_safe_string(feed_url.replace("http", ""))
         async with self.mass.http_session.get(feed_url) as response:
             if response.status == 200:
                 feed_data = await response.read()
@@ -168,7 +172,7 @@ class PodcastMusicprovider(MusicProvider):
         for episode in self.parsed["episodes"]:
             if item_id == episode["guid"]:
                 return StreamDetails(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     item_id=item_id,
                     audio_format=AudioFormat(
                         # hard coded to unknown, so ffmpeg figures out
@@ -185,7 +189,7 @@ class PodcastMusicprovider(MusicProvider):
         podcast = Podcast(
             item_id=self.podcast_id,
             name=self.parsed["title"],
-            provider=self.domain,
+            provider=self.lookup_key,
             uri=self.parsed["link"],
             total_episodes=len(self.parsed["episodes"]),
             provider_mappings={
@@ -220,13 +224,13 @@ class PodcastMusicprovider(MusicProvider):
         item_id = episode_obj["guid"]
         episode = PodcastEpisode(
             item_id=item_id,
-            provider=self.domain,
+            provider=self.lookup_key,
             name=name,
             duration=episode_obj["total_time"],
-            position=episode_obj.get("number", fallback_position),
+            position=episode_obj.get("number", episode_obj.get("published", fallback_position)),
             podcast=ItemMapping(
                 item_id=self.podcast_id,
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 name=self.parsed["title"],
                 media_type=MediaType.PODCAST,
             ),
@@ -242,6 +246,15 @@ class PodcastMusicprovider(MusicProvider):
                 )
             },
         )
+        if "chapters" in episode_obj:
+            episode.metadata.chapters = [
+                MediaItemChapter(
+                    position=idx,
+                    name=chapter_obj["title"],
+                    start=chapter_obj["start"],
+                )
+                for idx, chapter_obj in enumerate(episode_obj["chapters"])
+            ]
 
         if "episode_art_url" in episode_obj:
             episode.metadata.images = [
@@ -253,6 +266,7 @@ class PodcastMusicprovider(MusicProvider):
                 )
             ]
         episode.metadata.description = episode_obj["description"]
-        episode.metadata.explicit = episode_obj["explicit"]
+        if "explicit" in episode_obj:
+            episode.metadata.explicit = episode_obj["explicit"]
 
         return episode

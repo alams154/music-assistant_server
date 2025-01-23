@@ -250,7 +250,7 @@ class DLNAPlayerProvider(PlayerProvider):
         self.upnp_factory = UpnpFactory(self.requester, non_strict=True)
         self.notify_server = DLNANotifyServer(self.requester, self.mass)
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 

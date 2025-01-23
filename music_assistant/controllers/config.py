@@ -201,7 +201,7 @@ class ConfigController:
                 if prov.domain == raw_conf["domain"]:
                     break
             else:
-                msg = f'Unknown provider domain: {raw_conf["domain"]}'
+                msg = f"Unknown provider domain: {raw_conf['domain']}"
                 raise KeyError(msg)
             return ProviderConfig.parse(config_entries, raw_conf)
         msg = f"No config found for provider id {instance_id}"
@@ -291,7 +291,7 @@ class ConfigController:
             msg = f"Builtin provider {prov_manifest.name} can not be removed."
             raise RuntimeError(msg)
         self.remove(conf_key)
-        await self.mass.unload_provider(instance_id)
+        await self.mass.unload_provider(instance_id, True)
         if existing["type"] == "music":
             # cleanup entries in library
             await self.mass.music.cleanup_provider(instance_id)
@@ -916,4 +916,7 @@ class ConfigController:
             # loading failed, remove config
             self.remove(conf_key)
             raise
+        if prov.type == ProviderType.MUSIC:
+            # kick off initial library scan
+            self.mass.music.start_sync(None, [config.instance_id])
         return config

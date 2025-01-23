@@ -56,7 +56,7 @@ PLAYER_CONFIG_ENTRIES = (
 # originally/officially cast supports 96k sample rate (even for groups)
 # but it seems a (recent?) update broke this ?!
 # For now only set safe default values and let the user try out higher values
-CONF_ENTRY_SAMPLE_RATES_CAST = create_sample_rates_config_entry(96000, 24, 48000, 24)
+CONF_ENTRY_SAMPLE_RATES_CAST = create_sample_rates_config_entry(192000, 24, 48000, 24)
 CONF_ENTRY_SAMPLE_RATES_CAST_GROUP = create_sample_rates_config_entry(96000, 24, 44100, 16)
 
 
@@ -153,7 +153,7 @@ class ChromecastProvider(PlayerProvider):
         # start discovery in executor
         await self.mass.loop.run_in_executor(None, self.browser.start_discovery)
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         if not self.browser:
             return
@@ -291,7 +291,7 @@ class ChromecastProvider(PlayerProvider):
         }
         media_controller = castplayer.cc.media_controller
         queuedata["mediaSessionId"] = media_controller.status.media_session_id
-        self.mass.create_task(media_controller.send_message, data=queuedata, inc_session_id=True)
+        await asyncio.to_thread(media_controller.send_message, data=queuedata, inc_session_id=True)
         self.logger.debug(
             "Enqued next track (%s) to player %s",
             media.title or media.uri,
@@ -712,7 +712,7 @@ class ChromecastProvider(PlayerProvider):
                     }
                 },
             }
-            self.mass.create_task(
+            await asyncio.to_thread(
                 media_controller.send_message, data=queuedata, inc_session_id=True
             )
 
@@ -743,4 +743,4 @@ class ChromecastProvider(PlayerProvider):
                     }
                 ],
             }
-            self.mass.create_task(media_controller.send_message, data=msg, inc_session_id=True)
+            await asyncio.to_thread(media_controller.send_message, data=msg, inc_session_id=True)

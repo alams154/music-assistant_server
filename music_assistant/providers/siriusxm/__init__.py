@@ -25,7 +25,7 @@ from music_assistant_models.media_items import (
     ProviderMapping,
     Radio,
 )
-from music_assistant_models.streamdetails import StreamDetails
+from music_assistant_models.streamdetails import LivestreamMetadata, StreamDetails
 from tenacity import RetryError
 
 from music_assistant.helpers.util import select_free_port
@@ -175,7 +175,7 @@ class SiriusXMProvider(MusicProvider):
 
         self.logger.debug(f"SXM Proxy server running at {bind_ip}:{bind_port}")
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 
@@ -232,7 +232,7 @@ class SiriusXMProvider(MusicProvider):
         # See `_channel_updated` for where this is handled.
         self._current_stream_details = StreamDetails(
             item_id=item_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
                 content_type=ContentType.AAC,
             ),
@@ -270,9 +270,10 @@ class SiriusXMProvider(MusicProvider):
         if latest_cut_marker:
             latest_cut = latest_cut_marker.cut
             title = latest_cut.title
-            artists = ", ".join([a.name for a in latest_cut.artists])
-
-            self._current_stream_details.stream_title = f"{title} - {artists}"
+            self._current_stream_details.stream_metadata = LivestreamMetadata(
+                title=title,
+                artist=", ".join([a.name for a in latest_cut.artists]),
+            )
 
     async def _refresh_channels(self) -> bool:
         self._channels = await self._client.channels
@@ -286,7 +287,7 @@ class SiriusXMProvider(MusicProvider):
 
     def _parse_radio(self, channel: XMChannel) -> Radio:
         radio = Radio(
-            provider=self.instance_id,
+            provider=self.lookup_key,
             item_id=channel.id,
             name=channel.name,
             provider_mappings={
@@ -308,7 +309,7 @@ class SiriusXMProvider(MusicProvider):
         if icon is not None:
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.THUMB,
                     path=icon,
                     remotely_accessible=True,
@@ -316,7 +317,7 @@ class SiriusXMProvider(MusicProvider):
             )
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.LOGO,
                     path=icon,
                     remotely_accessible=True,
@@ -326,7 +327,7 @@ class SiriusXMProvider(MusicProvider):
         if banner is not None:
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.BANNER,
                     path=banner,
                     remotely_accessible=True,
@@ -334,7 +335,7 @@ class SiriusXMProvider(MusicProvider):
             )
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.LANDSCAPE,
                     path=banner,
                     remotely_accessible=True,

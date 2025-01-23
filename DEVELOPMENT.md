@@ -3,7 +3,7 @@ Developer docs
 
 ## 📝 Prerequisites
 * ffmpeg (minimum version 6.1, version 7 recommended), must be available in the path so install at OS level
-* Python 3.11 is minimal required, 3.12 recommended (or check the pyproject for current required version)
+* Python 3.12 is minimal required, 3.12 recommended (or check the pyproject for current required version)
 * [Python venv](https://docs.python.org/3/library/venv.html)
 
 We recommend developing on a (recent) MacOS or Linux machine.
@@ -16,6 +16,7 @@ With this repository cloned locally, execute the following commands in a termina
 * Run our development setup script to setup the development environment:
 * `scripts/setup.sh` (creates a new separate virtual environment to nicely separate the project dependencies)
 * The setup script will create a separate virtual environment (if needed), install all the project/test dependencies and configure pre-commit for linting and testing.
+* Make sure, that the python interpreter in VS Code is set to the newly generated venv.
 * Debug: Hit (Fn +) F5 to start Music Assistant locally
 * The pre-compiled UI of Music Assistant will be available at `localhost:8095` 🎉
 

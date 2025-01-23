@@ -3,11 +3,9 @@
 import pathlib
 from typing import Final
 
-from music_assistant_models.config_entries import (
-    ConfigEntry,
-    ConfigEntryType,
-    ConfigValueOption,
-)
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.enums import ConfigEntryType, ContentType
+from music_assistant_models.media_items import AudioFormat
 
 API_SCHEMA_VERSION: Final[int] = 26
 MIN_SCHEMA_VERSION: Final[int] = 24
@@ -479,6 +477,14 @@ CONF_ENTRY_ENABLE_ICY_METADATA = ConfigEntry(
     "this correctly. If you experience issues with playback, try to disable this setting.",
 )
 
+CONF_ENTRY_WARN_PREVIEW = ConfigEntry(
+    key="preview_note",
+    type=ConfigEntryType.ALERT,
+    label="Please note that this feature/provider is still in early stages. \n\n"
+    "Functionality may still be limited and/or bugs may occur!",
+    required=False,
+)
+
 
 def create_sample_rates_config_entry(
     max_sample_rate: int,
@@ -517,4 +523,28 @@ BASE_PLAYER_CONFIG_ENTRIES = (
     CONF_ENTRY_TTS_PRE_ANNOUNCE,
     CONF_ENTRY_SAMPLE_RATES,
     CONF_ENTRY_HTTP_PROFILE_FORCED_2,
+)
+
+
+DEFAULT_STREAM_HEADERS = {
+    "Server": "Music Assistant",
+    "transferMode.dlna.org": "Streaming",
+    "contentFeatures.dlna.org": "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000",  # noqa: E501
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+ICY_HEADERS = {
+    "icy-name": "Music Assistant",
+    "icy-description": "Music Assistant - Your personal music assistant",
+    "icy-version": "1",
+    "icy-logo": MASS_LOGO_ONLINE,
+}
+
+DEFAULT_PCM_FORMAT = AudioFormat(
+    # always prefer float32 as internal pcm format to create headroom
+    # for filters such as dsp and volume normalization
+    content_type=ContentType.PCM_F32LE,
+    sample_rate=48000,
+    bit_depth=32,
+    channels=2,
 )

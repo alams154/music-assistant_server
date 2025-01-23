@@ -54,6 +54,7 @@ from music_assistant.constants import (
     CONF_ENTRY_SYNC_ADJUST,
     CONF_PORT,
     CONF_SYNC_ADJUST,
+    DEFAULT_PCM_FORMAT,
     VERBOSE_LOG_LEVEL,
     create_sample_rates_config_entry,
 )
@@ -266,7 +267,7 @@ class SlimprotoProvider(PlayerProvider):
             "/slimproto/multi", self._serve_multi_client_stream
         )
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         self.mass.streams.unregister_dynamic_route("/slimproto/multi")
         await self.slimproto.stop()
@@ -365,9 +366,9 @@ class SlimprotoProvider(PlayerProvider):
 
         # this is a syncgroup, we need to handle this with a multi client stream
         master_audio_format = AudioFormat(
-            content_type=ContentType.PCM_F32LE,
-            sample_rate=48000,
-            bit_depth=32,
+            content_type=DEFAULT_PCM_FORMAT.content_type,
+            sample_rate=DEFAULT_PCM_FORMAT.sample_rate,
+            bit_depth=DEFAULT_PCM_FORMAT.bit_depth,
         )
         if media.media_type == MediaType.ANNOUNCEMENT:
             # special case: stream announcement
@@ -380,7 +381,8 @@ class SlimprotoProvider(PlayerProvider):
             # special case: UGP stream
             ugp_provider: PlayerGroupProvider = self.mass.get_provider("player_group")
             ugp_stream = ugp_provider.ugp_streams[media.queue_id]
-            audio_source = ugp_stream.subscribe()
+            # Filter is later applied in MultiClientStream
+            audio_source = ugp_stream.get_stream(master_audio_format, filter_params=None)
         elif media.queue_id and media.queue_item_id:
             # regular queue stream request
             audio_source = self.mass.streams.get_flow_stream(
@@ -644,6 +646,7 @@ class SlimprotoProvider(PlayerProvider):
                 supported_features={
                     PlayerFeature.POWER,
                     PlayerFeature.SET_MEMBERS,
+                    PlayerFeature.MULTI_DEVICE_DSP,
                     PlayerFeature.VOLUME_SET,
                     PlayerFeature.PAUSE,
                     PlayerFeature.VOLUME_MUTE,

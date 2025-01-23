@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import time
 from typing import TYPE_CHECKING, Any, cast
@@ -207,9 +208,11 @@ async def get_config_entries(
             key=CONF_CLIENT_ID,
             type=ConfigEntryType.SECURE_STRING,
             label="Client ID (optional)",
-            description="By default, a generic client ID is used which is heavy rate limited. "
-            "It is advised that you create your own Spotify Developer account and use "
-            "that client ID here to speedup performance. \n\n"
+            description="By default, a generic client ID is used which is (heavy) rate limited. "
+            "To speedup performance, it is advised that you create your own Spotify Developer "
+            "account and use that client ID here, but this comes at the cost of some features "
+            "due to Spotify policies. For example Radio mode/recommendations and featured playlists"
+            "will not work with a custom client ID. \n\n"
             f"Use {CALLBACK_REDIRECT_URL} as callback URL.",
             required=False,
             value=values.get(CONF_CLIENT_ID) if values else None,
@@ -242,6 +245,7 @@ class SpotifyProvider(MusicProvider):
     _auth_info: str | None = None
     _sp_user: dict[str, Any] | None = None
     _librespot_bin: str | None = None
+    custom_client_id_active: bool = False
     throttler: ThrottlerManager
 
     async def handle_async_init(self) -> None:
@@ -252,6 +256,7 @@ class SpotifyProvider(MusicProvider):
             # loosen the throttler a bit when a custom client id is used
             self.throttler.rate_limit = 45
             self.throttler.period = 30
+            self.custom_client_id_active = True
         # check if we have a librespot binary for this arch
         self._librespot_bin = await get_librespot_binary()
         # try login which will raise if it fails
@@ -260,7 +265,7 @@ class SpotifyProvider(MusicProvider):
     @property
     def supported_features(self) -> set[ProviderFeature]:
         """Return the features supported by this Provider."""
-        return {
+        base = {
             ProviderFeature.LIBRARY_ARTISTS,
             ProviderFeature.LIBRARY_ALBUMS,
             ProviderFeature.LIBRARY_TRACKS,
@@ -275,8 +280,12 @@ class SpotifyProvider(MusicProvider):
             ProviderFeature.SEARCH,
             ProviderFeature.ARTIST_ALBUMS,
             ProviderFeature.ARTIST_TOPTRACKS,
-            ProviderFeature.SIMILAR_TRACKS,
         }
+        if not self.custom_client_id_active:
+            # Spotify has killed the similar tracks api for developers
+            # https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api
+            base.add(ProviderFeature.SIMILAR_TRACKS)
+        return base
 
     @property
     def name(self) -> str:
@@ -372,8 +381,8 @@ class SpotifyProvider(MusicProvider):
     async def _get_liked_songs_playlist(self) -> Playlist:
         liked_songs = Playlist(
             item_id=self._get_liked_songs_playlist_id(),
-            provider=self.domain,
-            name=f'Liked Songs {self._sp_user["display_name"]}',  # TODO to be translated
+            provider=self.lookup_key,
+            name=f"Liked Songs {self._sp_user['display_name']}",  # TODO to be translated
             owner=self._sp_user["display_name"],
             provider_mappings={
                 ProviderMapping(
@@ -391,7 +400,7 @@ class SpotifyProvider(MusicProvider):
             MediaItemImage(
                 type=ImageType.THUMB,
                 path="https://misc.scdn.co/liked-songs/liked-songs-64.png",
-                provider=self.domain,
+                provider=self.lookup_key,
                 remotely_accessible=True,
             )
         ]
@@ -520,7 +529,7 @@ class SpotifyProvider(MusicProvider):
             for item in spotify_result["items"]:
                 if not (item and item["track"] and item["track"]["id"]):
                     continue
-                track_uris.append({"uri": f'spotify:track:{item["track"]["id"]}'})
+                track_uris.append({"uri": f"spotify:track:{item['track']['id']}"})
         data = {"tracks": track_uris}
         await self._delete_data(f"playlists/{prov_playlist_id}/tracks", data=data)
 
@@ -543,11 +552,13 @@ class SpotifyProvider(MusicProvider):
         """Return the content details for the given track when it will be streamed."""
         return StreamDetails(
             item_id=item_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
                 content_type=ContentType.OGG,
             ),
             stream_type=StreamType.CUSTOM,
+            allow_seek=True,
+            can_seek=True,
         )
 
     async def get_audio_stream(
@@ -560,8 +571,7 @@ class SpotifyProvider(MusicProvider):
             self._librespot_bin,
             "--cache",
             self.cache_dir,
-            "--cache-size-limit",
-            "1G",
+            "--disable-audio-cache",
             "--passthrough",
             "--bitrate",
             "320",
@@ -576,26 +586,48 @@ class SpotifyProvider(MusicProvider):
         if seek_position:
             args += ["--start-position", str(int(seek_position))]
         chunk_size = get_chunksize(streamdetails.audio_format)
-        stderr = None if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL) else False
+        stderr = bool(self.logger.isEnabledFor(logging.DEBUG))
         bytes_received = 0
-        async with AsyncProcess(
+        log_lines: list[str] = []
+
+        librespot_proc: AsyncProcess = AsyncProcess(
             args,
             stdout=True,
             stderr=stderr,
             name="librespot",
-        ) as librespot_proc:
+        )
+        try:
+            await librespot_proc.start()
+
+            async def _read_stderr():
+                logger = self.logger.getChild("librespot")
+                async for line in librespot_proc.iter_stderr():
+                    log_lines.append(line)
+                    logger.log(VERBOSE_LOG_LEVEL, line)
+
+            if stderr:
+                log_reader = self.mass.create_task(_read_stderr())
+
             async for chunk in librespot_proc.iter_any(chunk_size):
                 yield chunk
                 bytes_received += len(chunk)
+            if stderr:
+                await log_reader
 
-        if librespot_proc.returncode != 0 or bytes_received == 0:
-            raise AudioError(f"Failed to stream track {spotify_uri}")
+            if bytes_received == 0:
+                raise AudioError("No audio received from librespot")
+
+        finally:
+            await librespot_proc.close()
+            if not bytes_received:
+                log_lines = "\n".join(log_lines)
+                self.logger.error("Error while streaming track %s\n%s", spotify_uri, log_lines)
 
     def _parse_artist(self, artist_obj):
         """Parse spotify artist object to generic layout."""
         artist = Artist(
             item_id=artist_obj["id"],
-            provider=self.domain,
+            provider=self.lookup_key,
             name=artist_obj["name"] or artist_obj["id"],
             provider_mappings={
                 ProviderMapping(
@@ -616,7 +648,7 @@ class SpotifyProvider(MusicProvider):
                         MediaItemImage(
                             type=ImageType.THUMB,
                             path=img_url,
-                            provider=self.instance_id,
+                            provider=self.lookup_key,
                             remotely_accessible=True,
                         )
                     ]
@@ -628,7 +660,7 @@ class SpotifyProvider(MusicProvider):
         name, version = parse_title_and_version(album_obj["name"])
         album = Album(
             item_id=album_obj["id"],
-            provider=self.domain,
+            provider=self.lookup_key,
             name=name,
             version=version,
             provider_mappings={
@@ -661,7 +693,7 @@ class SpotifyProvider(MusicProvider):
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=album_obj["images"][0]["url"],
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     remotely_accessible=True,
                 )
             ]
@@ -684,7 +716,7 @@ class SpotifyProvider(MusicProvider):
         name, version = parse_title_and_version(track_obj["name"])
         track = Track(
             item_id=track_obj["id"],
-            provider=self.domain,
+            provider=self.lookup_key,
             name=name,
             version=version,
             duration=track_obj["duration_ms"] / 1000,
@@ -726,7 +758,7 @@ class SpotifyProvider(MusicProvider):
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=track_obj["album"]["images"][0]["url"],
-                        provider=self.instance_id,
+                        provider=self.lookup_key,
                         remotely_accessible=True,
                     )
                 ]
@@ -740,9 +772,12 @@ class SpotifyProvider(MusicProvider):
 
     def _parse_playlist(self, playlist_obj):
         """Parse spotify playlist object to generic layout."""
+        is_editable = (
+            playlist_obj["owner"]["id"] == self._sp_user["id"] or playlist_obj["collaborative"]
+        )
         playlist = Playlist(
             item_id=playlist_obj["id"],
-            provider=self.domain,
+            provider=self.instance_id if is_editable else self.lookup_key,
             name=playlist_obj["name"],
             owner=playlist_obj["owner"]["display_name"],
             provider_mappings={
@@ -753,16 +788,14 @@ class SpotifyProvider(MusicProvider):
                     url=playlist_obj["external_urls"]["spotify"],
                 )
             },
-        )
-        playlist.is_editable = (
-            playlist_obj["owner"]["id"] == self._sp_user["id"] or playlist_obj["collaborative"]
+            is_editable=is_editable,
         )
         if playlist_obj.get("images"):
             playlist.metadata.images = [
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=playlist_obj["images"][0]["url"],
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     remotely_accessible=True,
                 )
             ]
@@ -873,7 +906,7 @@ class SpotifyProvider(MusicProvider):
         kwargs["country"] = "from_token"
         if not (auth_info := kwargs.pop("auth_info", None)):
             auth_info = await self.login()
-        headers = {"Authorization": f'Bearer {auth_info["access_token"]}'}
+        headers = {"Authorization": f"Bearer {auth_info['access_token']}"}
         locale = self.mass.metadata.locale.replace("_", "-")
         language = locale.split("-")[0]
         headers["Accept-Language"] = f"{locale}, {language};q=0.9, *;q=0.5"
@@ -909,7 +942,7 @@ class SpotifyProvider(MusicProvider):
         """Delete data from api."""
         url = f"https://api.spotify.com/v1/{endpoint}"
         auth_info = kwargs.pop("auth_info", await self.login())
-        headers = {"Authorization": f'Bearer {auth_info["access_token"]}'}
+        headers = {"Authorization": f"Bearer {auth_info['access_token']}"}
         async with self.mass.http_session.delete(
             url, headers=headers, params=kwargs, json=data, ssl=False
         ) as response:
@@ -934,7 +967,7 @@ class SpotifyProvider(MusicProvider):
         """Put data on api."""
         url = f"https://api.spotify.com/v1/{endpoint}"
         auth_info = kwargs.pop("auth_info", await self.login())
-        headers = {"Authorization": f'Bearer {auth_info["access_token"]}'}
+        headers = {"Authorization": f"Bearer {auth_info['access_token']}"}
         async with self.mass.http_session.put(
             url, headers=headers, params=kwargs, json=data, ssl=False
         ) as response:
@@ -960,7 +993,7 @@ class SpotifyProvider(MusicProvider):
         """Post data on api."""
         url = f"https://api.spotify.com/v1/{endpoint}"
         auth_info = kwargs.pop("auth_info", await self.login())
-        headers = {"Authorization": f'Bearer {auth_info["access_token"]}'}
+        headers = {"Authorization": f"Bearer {auth_info['access_token']}"}
         async with self.mass.http_session.post(
             url, headers=headers, params=kwargs, json=data, ssl=False
         ) as response:

@@ -2,29 +2,21 @@
 
 from __future__ import annotations
 
-import mimetypes
+import hashlib
 import socket
-import uuid
 from asyncio import TaskGroup
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
 
 from aiojellyfin import MediaLibrary as JellyMediaLibrary
-from aiojellyfin import NotFound, SessionConfiguration, authenticate_by_name
-from aiojellyfin import Track as JellyTrack
+from aiojellyfin import NotFound, authenticate_by_name
+from aiojellyfin.session import SessionConfiguration
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
-from music_assistant_models.enums import (
-    ConfigEntryType,
-    ContentType,
-    MediaType,
-    ProviderFeature,
-    StreamType,
-)
+from music_assistant_models.enums import ConfigEntryType, MediaType, ProviderFeature, StreamType
 from music_assistant_models.errors import LoginFailed, MediaNotFoundError
 from music_assistant_models.media_items import (
     Album,
     Artist,
-    AudioFormat,
     Playlist,
     ProviderMapping,
     SearchResults,
@@ -32,11 +24,12 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant import MusicAssistant
 from music_assistant.constants import UNKNOWN_ARTIST_ID_MBID
+from music_assistant.mass import MusicAssistant
 from music_assistant.models import ProviderInstanceType
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.providers.jellyfin.parsers import (
+    audio_format,
     parse_album,
     parse_artist,
     parse_playlist,
@@ -46,12 +39,8 @@ from music_assistant.providers.jellyfin.parsers import (
 from .const import (
     ALBUM_FIELDS,
     ARTIST_FIELDS,
-    CLIENT_VERSION,
     ITEM_KEY_COLLECTION_TYPE,
     ITEM_KEY_ID,
-    ITEM_KEY_MEDIA_CHANNELS,
-    ITEM_KEY_MEDIA_CODEC,
-    ITEM_KEY_MEDIA_SOURCES,
     ITEM_KEY_MEDIA_STREAMS,
     ITEM_KEY_NAME,
     ITEM_KEY_RUNTIME_TICKS,
@@ -133,20 +122,38 @@ class JellyfinProvider(MusicProvider):
 
     async def handle_async_init(self) -> None:
         """Initialize provider(instance) with given configuration."""
+        username = str(self.config.get_value(CONF_USERNAME))
+
+        # Device ID should be stable between reboots
+        # Otherwise every time the provider starts we "leak" a new device
+        # entry in the Jellyfin backend, which creates devices and entities
+        # in HA if they also use the Jellyfin integration there.
+
+        # We follow a suggestion a Jellyfin dev gave to HA and use an ID
+        # that is stable even if provider is removed and re-added.
+        # They said mix in username in case the same device/app has 2
+        # connections to the same servers
+
+        # Neither of these are secrets (username is handed over to mint a
+        # token and server_id is used in zeroconf) but hash them anyway as its meant
+        # to be an opaque identifier
+
+        device_id = hashlib.sha256(f"{self.mass.server_id}+{username}".encode()).hexdigest()
+
         session_config = SessionConfiguration(
             session=self.mass.http_session,
             url=str(self.config.get_value(CONF_URL)),
             verify_ssl=bool(self.config.get_value(CONF_VERIFY_SSL)),
             app_name=USER_APP_NAME,
-            app_version=CLIENT_VERSION,
+            app_version=self.mass.version,
             device_name=socket.gethostname(),
-            device_id=str(uuid.uuid4()),
+            device_id=device_id,
         )
 
         try:
             self._client = await authenticate_by_name(
                 session_config,
-                str(self.config.get_value(CONF_USERNAME)),
+                username,
                 str(self.config.get_value(CONF_PASSWORD)),
             )
         except Exception as err:
@@ -354,7 +361,7 @@ class JellyfinProvider(MusicProvider):
             artist = Artist(
                 item_id=UNKNOWN_ARTIST_MAPPING.item_id,
                 name=UNKNOWN_ARTIST_MAPPING.name,
-                provider=self.domain,
+                provider=self.lookup_key,
                 provider_mappings={
                     ProviderMapping(
                         item_id=UNKNOWN_ARTIST_MAPPING.item_id,
@@ -391,24 +398,21 @@ class JellyfinProvider(MusicProvider):
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks."""
         result: list[Track] = []
-        if page > 0:
-            # paging not supported, we always return the whole list at once
-            return []
-        # TODO: Does Jellyfin support paging here?
-        jellyfin_playlist = await self._client.get_playlist(prov_playlist_id)
         playlist_items = (
-            await self._client.tracks.parent(jellyfin_playlist[ITEM_KEY_ID])
+            await self._client.tracks.in_playlist(prov_playlist_id)
             .enable_userdata()
             .fields(*TRACK_FIELDS)
+            .limit(100)
+            .start_index(page * 100)
             .request()
         )
         for index, jellyfin_track in enumerate(playlist_items["Items"], 1):
+            pos = (page * 100) + index
             try:
                 if track := parse_track(
                     self.logger, self.instance_id, self._client, jellyfin_track
                 ):
-                    if not track.position:
-                        track.position = index
+                    track.position = pos
                     result.append(track)
             except (KeyError, ValueError) as err:
                 self.logger.error(
@@ -436,20 +440,13 @@ class JellyfinProvider(MusicProvider):
     ) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
         jellyfin_track = await self._client.get_track(item_id)
-        mimetype = self._media_mime_type(jellyfin_track)
-        media_stream = jellyfin_track[ITEM_KEY_MEDIA_STREAMS][0]
-        url = self._client.audio_url(jellyfin_track[ITEM_KEY_ID], SUPPORTED_CONTAINER_FORMATS)
-        if ITEM_KEY_MEDIA_CODEC in media_stream:
-            content_type = ContentType.try_parse(media_stream[ITEM_KEY_MEDIA_CODEC])
-        else:
-            content_type = ContentType.try_parse(mimetype) if mimetype else ContentType.UNKNOWN
+        url = self._client.audio_url(
+            jellyfin_track[ITEM_KEY_ID], container=SUPPORTED_CONTAINER_FORMATS
+        )
         return StreamDetails(
             item_id=jellyfin_track[ITEM_KEY_ID],
-            provider=self.instance_id,
-            audio_format=AudioFormat(
-                content_type=content_type,
-                channels=jellyfin_track[ITEM_KEY_MEDIA_STREAMS][0][ITEM_KEY_MEDIA_CHANNELS],
-            ),
+            provider=self.lookup_key,
+            audio_format=audio_format(jellyfin_track),
             stream_type=StreamType.HTTP,
             duration=int(
                 jellyfin_track[ITEM_KEY_RUNTIME_TICKS] / 10000000
@@ -489,18 +486,3 @@ class JellyfinProvider(MusicProvider):
             ):
                 result.append(library)
         return result
-
-    def _media_mime_type(self, media_item: JellyTrack) -> str | None:
-        """Return the mime type of a media item."""
-        if not media_item.get(ITEM_KEY_MEDIA_SOURCES):
-            return None
-
-        media_source = media_item[ITEM_KEY_MEDIA_SOURCES][0]
-
-        if "Path" not in media_source:
-            return None
-
-        path = media_source["Path"]
-        mime_type, _ = mimetypes.guess_type(path)
-
-        return mime_type
