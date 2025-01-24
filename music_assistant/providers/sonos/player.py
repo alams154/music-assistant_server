@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 import shortuuid
 from aiohttp.client_exceptions import ClientConnectorError
 from aiosonos.api.models import ContainerType, MusicService, SonosCapability
-from aiosonos.api.models import PlayBackState as SonosPlayBackState
 from aiosonos.client import SonosLocalApiClient
 from aiosonos.const import EventType as SonosEventType
 from aiosonos.const import SonosEvent
@@ -86,6 +85,18 @@ class SonosPlayer:
             self.player_id, CONF_AIRPLAY_MODE, False
         )
 
+    @property
+    def airplay_mode_active(self) -> bool:
+        """Return if airplay mode is active for the player."""
+        return (
+            self.airplay_mode_enabled
+            and self.client.player.is_coordinator
+            and (active_group := self.client.player.group)
+            and active_group.container_type == ContainerType.AIRPLAY
+            and (airplay_player := self.get_linked_airplay_player(False))
+            and airplay_player.state in (PlayerState.PLAYING, PlayerState.PAUSED)
+        )
+
     def get_linked_airplay_player(self, enabled_only: bool = True) -> Player | None:
         """Return the linked airplay player if available/enabled."""
         if enabled_only and not self.airplay_mode_enabled:
@@ -118,13 +129,8 @@ class SonosPlayer:
             name=self.discovery_info["device"]["name"]
             or self.discovery_info["device"]["modelDisplayName"],
             available=True,
-            # treat as powered at start if the player is playing/paused
-            powered=self.client.player.group.playback_state
-            in (
-                SonosPlayBackState.PLAYBACK_STATE_PLAYING,
-                SonosPlayBackState.PLAYBACK_STATE_BUFFERING,
-                SonosPlayBackState.PLAYBACK_STATE_PAUSED,
-            ),
+            # sonos has no power support so we always assume its powered
+            powered=True,
             device_info=DeviceInfo(
                 model=self.discovery_info["device"]["modelDisplayName"],
                 manufacturer=self.prov.manifest.name,
@@ -157,11 +163,18 @@ class SonosPlayer:
             )
         )
         # register callback for playerqueue state changes
+        # note we don't filter on the player_id here because we also need to catch
+        # events from group players
         self._on_cleanup_callbacks.append(
             self.mass.subscribe(
                 self._on_mass_queue_items_event,
                 EventType.QUEUE_ITEMS_UPDATED,
-                self.player_id,
+            )
+        )
+        self._on_cleanup_callbacks.append(
+            self.mass.subscribe(
+                self._on_mass_queue_event,
+                EventType.QUEUE_UPDATED,
             )
         )
 
@@ -183,7 +196,7 @@ class SonosPlayer:
         if self.client.player.is_passive:
             self.logger.debug("Ignore STOP command: Player is synced to another player.")
             return
-        if (airplay := self.get_linked_airplay_player(True)) and airplay.state != PlayerState.IDLE:
+        if (airplay := self.get_linked_airplay_player(True)) and self.airplay_mode_active:
             # linked airplay player is active, redirect the command
             self.logger.debug("Redirecting STOP command to linked airplay player.")
             if player_provider := self.mass.get_provider(airplay.provider):
@@ -213,7 +226,7 @@ class SonosPlayer:
         if self.client.player.is_passive:
             self.logger.debug("Ignore STOP command: Player is synced to another player.")
             return
-        if (airplay := self.get_linked_airplay_player(True)) and airplay.state != PlayerState.IDLE:
+        if (airplay := self.get_linked_airplay_player(True)) and self.airplay_mode_active:
             # linked airplay player is active, redirect the command
             self.logger.debug("Redirecting PAUSE command to linked airplay player.")
             if player_provider := self.mass.get_provider(airplay.provider):
@@ -459,6 +472,8 @@ class SonosPlayer:
         if self.mass_player.active_source != event.object_id:
             return
         if not self.connected:
+            return
+        if not self.client.player.is_coordinator:
             return
         # sync crossfade and repeat modes
         queue = self.mass.player_queues.get(event.object_id)

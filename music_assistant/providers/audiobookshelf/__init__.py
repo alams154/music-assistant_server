@@ -5,6 +5,7 @@ Audiobookshelf is abbreviated ABS here.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Sequence
 from typing import TYPE_CHECKING
 
@@ -34,12 +35,13 @@ from music_assistant_models.media_items import (
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.models.music_provider import MusicProvider
-from music_assistant.providers.audiobookshelf.abs_client import ABSClient
+from music_assistant.providers.audiobookshelf.abs_client import ABSClient, LibraryWithItemIDs
 from music_assistant.providers.audiobookshelf.abs_schema import (
     ABSDeviceInfo,
-    ABSLibrary,
     ABSLibraryItemExpandedBook,
     ABSLibraryItemExpandedPodcast,
+    ABSLibraryItemMinifiedBook,
+    ABSLibraryItemMinifiedPodcast,
     ABSPlaybackSessionExpanded,
     ABSPodcastEpisodeExpanded,
 )
@@ -54,6 +56,8 @@ CONF_URL = "url"
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_VERIFY_SSL = "verify_ssl"
+# optionally hide podcasts with no episodes
+CONF_HIDE_EMPTY_PODCASTS = "hide_empty_podcasts"
 
 
 async def setup(
@@ -108,6 +112,15 @@ async def get_config_entries(
             category="advanced",
             default_value=True,
         ),
+        ConfigEntry(
+            key=CONF_HIDE_EMPTY_PODCASTS,
+            type=ConfigEntryType.BOOLEAN,
+            label="Hide empty podcasts.",
+            required=False,
+            description="This will skip podcasts with no episodes associated.",
+            category="advanced",
+            default_value=False,
+        ),
     )
 
 
@@ -140,7 +153,6 @@ class Audiobookshelf(MusicProvider):
         except RuntimeError:
             # login details were not correct
             raise LoginFailed(f"Login to abs instance at {base_url} failed.")
-        await self._client.sync()
 
         # this will be provided when creating sessions or receive already opened sessions
         self.device_info = ABSDeviceInfo(
@@ -174,7 +186,9 @@ class Audiobookshelf(MusicProvider):
         await self._client.sync()
         await super().sync_library(media_types=media_types)
 
-    def _parse_podcast(self, abs_podcast: ABSLibraryItemExpandedPodcast) -> Podcast:
+    def _parse_podcast(
+        self, abs_podcast: ABSLibraryItemExpandedPodcast | ABSLibraryItemMinifiedPodcast
+    ) -> Podcast:
         """Translate ABSPodcast to MassPodcast."""
         title = abs_podcast.media.metadata.title
         # Per API doc title may be None.
@@ -185,7 +199,6 @@ class Audiobookshelf(MusicProvider):
             name=title,
             publisher=abs_podcast.media.metadata.author,
             provider=self.lookup_key,
-            total_episodes=len(abs_podcast.media.episodes),
             provider_mappings={
                 ProviderMapping(
                     item_id=abs_podcast.id_,
@@ -208,6 +221,11 @@ class Audiobookshelf(MusicProvider):
         if abs_podcast.media.metadata.genres is not None:
             mass_podcast.metadata.genres = set(abs_podcast.media.metadata.genres)
         mass_podcast.metadata.release_date = abs_podcast.media.metadata.release_date
+
+        if isinstance(abs_podcast, ABSLibraryItemExpandedPodcast):
+            mass_podcast.total_episodes = len(abs_podcast.media.episodes)
+        elif isinstance(abs_podcast, ABSLibraryItemMinifiedPodcast):
+            mass_podcast.total_episodes = abs_podcast.media.num_episodes
 
         return mass_podcast
 
@@ -275,18 +293,23 @@ class Audiobookshelf(MusicProvider):
 
     async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
         """Retrieve library/subscribed podcasts from the provider."""
-        async for abs_podcast in self._client.get_all_podcasts():
+        async for abs_podcast in self._client.get_all_podcasts_minified():
             mass_podcast = self._parse_podcast(abs_podcast)
+            if (
+                bool(self.config.get_value(CONF_HIDE_EMPTY_PODCASTS))
+                and mass_podcast.total_episodes == 0
+            ):
+                continue
             yield mass_podcast
 
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
         """Get single podcast."""
-        abs_podcast = await self._client.get_podcast(prov_podcast_id)
+        abs_podcast = await self._client.get_podcast_expanded(prov_podcast_id)
         return self._parse_podcast(abs_podcast)
 
     async def get_podcast_episodes(self, prov_podcast_id: str) -> list[PodcastEpisode]:
         """Get all podcast episodes of podcast."""
-        abs_podcast = await self._client.get_podcast(prov_podcast_id)
+        abs_podcast = await self._client.get_podcast_expanded(prov_podcast_id)
         episode_list = []
         episode_cnt = 1
         for abs_episode in abs_podcast.media.episodes:
@@ -300,7 +323,7 @@ class Audiobookshelf(MusicProvider):
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
         """Get single podcast episode."""
         prov_podcast_id, e_id = prov_episode_id.split(" ")
-        abs_podcast = await self._client.get_podcast(prov_podcast_id)
+        abs_podcast = await self._client.get_podcast_expanded(prov_podcast_id)
         episode_cnt = 1
         for abs_episode in abs_podcast.media.episodes:
             if abs_episode.id_ == e_id:
@@ -309,7 +332,9 @@ class Audiobookshelf(MusicProvider):
             episode_cnt += 1
         raise MediaNotFoundError("Episode not found")
 
-    async def _parse_audiobook(self, abs_audiobook: ABSLibraryItemExpandedBook) -> Audiobook:
+    async def _parse_audiobook(
+        self, abs_audiobook: ABSLibraryItemExpandedBook | ABSLibraryItemMinifiedBook
+    ) -> Audiobook:
         mass_audiobook = Audiobook(
             item_id=abs_audiobook.id_,
             provider=self.lookup_key,
@@ -323,8 +348,6 @@ class Audiobookshelf(MusicProvider):
                 )
             },
             publisher=abs_audiobook.media.metadata.publisher,
-            authors=UniqueList([x.name for x in abs_audiobook.media.metadata.authors]),
-            narrators=UniqueList(abs_audiobook.media.metadata.narrators),
         )
         mass_audiobook.metadata.description = abs_audiobook.media.metadata.description
         if abs_audiobook.media.metadata.language is not None:
@@ -333,24 +356,7 @@ class Audiobookshelf(MusicProvider):
         if abs_audiobook.media.metadata.genres is not None:
             mass_audiobook.metadata.genres = set(abs_audiobook.media.metadata.genres)
 
-        # chapters
-        chapters = []
-        for idx, chapter in enumerate(abs_audiobook.media.chapters):
-            chapters.append(
-                MediaItemChapter(
-                    position=idx + 1,  # chapter starting at 1
-                    name=chapter.title,
-                    start=chapter.start,
-                    end=chapter.end,
-                )
-            )
-        mass_audiobook.metadata.chapters = chapters
-
         mass_audiobook.metadata.explicit = abs_audiobook.media.metadata.explicit
-        progress, finished = await self._client.get_audiobook_progress_ms(abs_audiobook.id_)
-        if progress is not None:
-            mass_audiobook.resume_position_ms = progress
-            mass_audiobook.fully_played = finished
 
         # cover
         base_url = f"{self.config.get_value(CONF_URL)}"
@@ -360,17 +366,43 @@ class Audiobookshelf(MusicProvider):
             [MediaItemImage(type=ImageType.THUMB, path=cover_url, provider=self.lookup_key)]
         )
 
+        # expanded version
+        if isinstance(abs_audiobook, ABSLibraryItemExpandedBook):
+            authors = UniqueList([x.name for x in abs_audiobook.media.metadata.authors])
+            narrators = UniqueList(abs_audiobook.media.metadata.narrators)
+            mass_audiobook.authors = authors
+            mass_audiobook.narrators = narrators
+            chapters = []
+            for idx, chapter in enumerate(abs_audiobook.media.chapters):
+                chapters.append(
+                    MediaItemChapter(
+                        position=idx + 1,  # chapter starting at 1
+                        name=chapter.title,
+                        start=chapter.start,
+                        end=chapter.end,
+                    )
+                )
+            mass_audiobook.metadata.chapters = chapters
+
+            progress, finished = await self._client.get_audiobook_progress_ms(abs_audiobook.id_)
+            if progress is not None:
+                mass_audiobook.resume_position_ms = progress
+                mass_audiobook.fully_played = finished
+        elif isinstance(abs_audiobook, ABSLibraryItemMinifiedBook):
+            mass_audiobook.authors = UniqueList([abs_audiobook.media.metadata.author_name])
+            mass_audiobook.narrators = UniqueList([abs_audiobook.media.metadata.narrator_name])
+
         return mass_audiobook
 
     async def get_library_audiobooks(self) -> AsyncGenerator[Audiobook, None]:
         """Get Audiobook libraries."""
-        async for abs_audiobook in self._client.get_all_audiobooks():
+        async for abs_audiobook in self._client.get_all_audiobooks_minified():
             mass_audiobook = await self._parse_audiobook(abs_audiobook)
             yield mass_audiobook
 
     async def get_audiobook(self, prov_audiobook_id: str) -> Audiobook:
         """Get a single audiobook."""
-        abs_audiobook = await self._client.get_audiobook(prov_audiobook_id)
+        abs_audiobook = await self._client.get_audiobook_expanded(prov_audiobook_id)
         return await self._parse_audiobook(abs_audiobook)
 
     async def get_streamdetails_from_playback_session(
@@ -419,7 +451,7 @@ class Audiobookshelf(MusicProvider):
         if media_type == MediaType.PODCAST_EPISODE:
             return await self._get_stream_details_podcast_episode(item_id)
         elif media_type == MediaType.AUDIOBOOK:
-            abs_audiobook = await self._client.get_audiobook(item_id)
+            abs_audiobook = await self._client.get_audiobook_expanded(item_id)
             tracks = abs_audiobook.media.tracks
             if len(tracks) == 0:
                 raise MediaNotFoundError("Stream not found")
@@ -427,6 +459,8 @@ class Audiobookshelf(MusicProvider):
                 session = await self._client.get_playback_session_audiobook(
                     device_info=self.device_info, audiobook_id=item_id
                 )
+                # small delay, allow abs to launch ffmpeg process
+                await asyncio.sleep(1)
                 return await self.get_streamdetails_from_playback_session(session)
             return await self._get_stream_details_audiobook(abs_audiobook)
         raise MediaNotFoundError("Stream unknown")
@@ -461,7 +495,7 @@ class Audiobookshelf(MusicProvider):
         abs_podcast_id, abs_episode_id = podcast_id.split(" ")
         abs_episode = None
 
-        abs_podcast = await self._client.get_podcast(abs_podcast_id)
+        abs_podcast = await self._client.get_podcast_expanded(abs_podcast_id)
         for abs_episode in abs_podcast.media.episodes:
             if abs_episode.id_ == abs_episode_id:
                 break
@@ -520,7 +554,7 @@ class Audiobookshelf(MusicProvider):
             )
 
     async def _browse_root(
-        self, library_list: list[ABSLibrary], item_path: str
+        self, library_list: list[LibraryWithItemIDs], item_path: str
     ) -> Sequence[MediaItemType | ItemMapping]:
         """Browse root folder in browse view.
 
@@ -542,7 +576,7 @@ class Audiobookshelf(MusicProvider):
     async def _browse_lib(
         self,
         library_id: str,
-        library_list: list[ABSLibrary],
+        library_list: list[LibraryWithItemIDs],
         media_type: MediaType,
     ) -> Sequence[MediaItemType | ItemMapping]:
         """Browse lib folder in browse view.
@@ -556,30 +590,16 @@ class Audiobookshelf(MusicProvider):
         if library is None:
             raise MediaNotFoundError("Lib missing.")
 
-        def get_item_mapping(
-            item: ABSLibraryItemExpandedBook | ABSLibraryItemExpandedPodcast,
-        ) -> ItemMapping:
-            title = item.media.metadata.title
-            if title is None:
-                title = "UNKNOWN"
-            token = self._client.token
-            url = f"{self.config.get_value(CONF_URL)}/api/items/{item.id_}/cover?token={token}"
-            image = MediaItemImage(type=ImageType.THUMB, path=url, provider=self.lookup_key)
-            return ItemMapping(
-                media_type=media_type,
-                item_id=item.id_,
-                provider=self.lookup_key,
-                name=title,
-                image=image,
-            )
-
         items: list[MediaItemType | ItemMapping] = []
-        if media_type == MediaType.PODCAST:
-            async for podcast in self._client.get_all_podcasts_by_library(library):
-                items.append(get_item_mapping(podcast))
-        elif media_type == MediaType.AUDIOBOOK:
-            async for audiobook in self._client.get_all_audiobooks_by_library(library):
-                items.append(get_item_mapping(audiobook))
+        if media_type in [MediaType.PODCAST, MediaType.AUDIOBOOK]:
+            for item_id in library.item_ids:
+                mass_item = await self.mass.music.get_library_item_by_prov_id(
+                    media_type=media_type,
+                    item_id=item_id,
+                    provider_instance_id_or_domain=self.instance_id,
+                )
+                if mass_item is not None:
+                    items.append(mass_item)
         else:
             raise RuntimeError(f"Media type must not be {media_type}")
         return items

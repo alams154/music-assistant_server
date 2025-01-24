@@ -221,8 +221,8 @@ class AirplayProvider(PlayerProvider):
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
         # power off all players (will disconnect and close cliraop)
-        for player_id in self._players:
-            await self.cmd_power(player_id, False)
+        for player in self._players.values():
+            await player.cmd_stop()
         # shutdown DACP server
         if self._dacp_server:
             self._dacp_server.close()

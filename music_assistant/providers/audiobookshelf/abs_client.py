@@ -5,10 +5,12 @@ We only implement the functions necessary for mass.
 
 import logging
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from aiohttp import ClientSession
+from mashumaro.exceptions import InvalidFieldValue, MissingField
 from music_assistant_models.media_items import UniqueList
 
 from music_assistant.providers.audiobookshelf.abs_schema import (
@@ -16,23 +18,29 @@ from music_assistant.providers.audiobookshelf.abs_schema import (
     ABSLibrariesItemsMinifiedBookResponse,
     ABSLibrariesItemsMinifiedPodcastResponse,
     ABSLibrariesResponse,
-    ABSLibrary,
     ABSLibraryItemExpandedBook,
     ABSLibraryItemExpandedPodcast,
     ABSLibraryItemMinifiedBook,
     ABSLibraryItemMinifiedPodcast,
     ABSLoginResponse,
     ABSMediaProgress,
-    ABSPlaybackSession,
     ABSPlaybackSessionExpanded,
     ABSPlayRequest,
-    ABSSessionsResponse,
     ABSSessionUpdate,
     ABSUser,
 )
 
 # use page calls in case of large libraries
 LIMIT_ITEMS_PER_PAGE = 10
+
+
+@dataclass
+class LibraryWithItemIDs:
+    """Helper class to store ABSLibrary, and the ids of the items associated."""
+
+    id_: str
+    name: str = ""
+    item_ids: UniqueList[str] = field(default_factory=UniqueList[str])
 
 
 class ABSStatus(Enum):
@@ -50,8 +58,8 @@ class ABSClient:
 
     def __init__(self) -> None:
         """Client authorization."""
-        self.podcast_libraries: list[ABSLibrary] = []
-        self.audiobook_libraries: list[ABSLibrary] = []
+        self.podcast_libraries: list[LibraryWithItemIDs] = []
+        self.audiobook_libraries: list[LibraryWithItemIDs] = []
         self.user: ABSUser
         self.check_ssl: bool
         # I would like to receive opened sessions via the API, however, it appears
@@ -153,25 +161,30 @@ class ABSClient:
     async def sync(self) -> None:
         """Update available book and podcast libraries."""
         data = await self._get("libraries")
-        libraries = ABSLibrariesResponse.from_json(data)
+        try:
+            libraries = ABSLibrariesResponse.from_json(data)
+        except (MissingField, InvalidFieldValue) as exc:
+            self.logger.error(exc)
+            return
         ids = [x.id_ for x in self.audiobook_libraries]
         ids.extend([x.id_ for x in self.podcast_libraries])
         for library in libraries.libraries:
             media_type = library.media_type
             if library.id_ not in ids:
+                _library = LibraryWithItemIDs(library.id_, library.name)
                 if media_type == "book":
-                    self.audiobook_libraries.append(library)
+                    self.audiobook_libraries.append(_library)
                 elif media_type == "podcast":
-                    self.podcast_libraries.append(library)
+                    self.podcast_libraries.append(_library)
         self.user = await self.get_authenticated_user()
 
-    async def get_all_podcasts(self) -> AsyncGenerator[ABSLibraryItemExpandedPodcast]:
+    async def get_all_podcasts_minified(self) -> AsyncGenerator[ABSLibraryItemMinifiedPodcast]:
         """Get all available podcasts."""
         for library in self.podcast_libraries:
-            async for podcast in self.get_all_podcasts_by_library(library):
+            async for podcast in self.get_all_podcasts_by_library_minified(library):
                 yield podcast
 
-    async def _get_lib_items(self, lib: ABSLibrary) -> AsyncGenerator[bytes]:
+    async def _get_lib_items(self, lib: LibraryWithItemIDs) -> AsyncGenerator[bytes]:
         """Get library items with pagination.
 
         Note:
@@ -189,30 +202,36 @@ class ABSClient:
             page_cnt += 1
             yield data
 
-    async def get_all_podcasts_by_library(
-        self, lib: ABSLibrary
-    ) -> AsyncGenerator[ABSLibraryItemExpandedPodcast]:
+    async def get_all_podcasts_by_library_minified(
+        self, lib: LibraryWithItemIDs
+    ) -> AsyncGenerator[ABSLibraryItemMinifiedPodcast]:
         """Get all podcasts in a library."""
         async for podcast_data in self._get_lib_items(lib):
-            podcast_list = ABSLibrariesItemsMinifiedPodcastResponse.from_json(podcast_data).results
+            try:
+                podcast_list = ABSLibrariesItemsMinifiedPodcastResponse.from_json(
+                    podcast_data
+                ).results
+            except (MissingField, InvalidFieldValue) as exc:
+                self.logger.error(exc)
+                return
             if not podcast_list:  # [] if page exceeds
                 return
 
-            async def _get_id(
-                plist: list[ABSLibraryItemMinifiedPodcast] = podcast_list,
-            ) -> AsyncGenerator[str]:
-                for entry in plist:
-                    yield entry.id_
-
-            async for id_ in _get_id():
-                podcast = await self.get_podcast(id_)
+            for podcast in podcast_list:
+                # store ids of library items for later use
+                lib.item_ids.append(podcast.id_)
                 yield podcast
 
-    async def get_podcast(self, id_: str) -> ABSLibraryItemExpandedPodcast:
+    async def get_podcast_expanded(self, id_: str) -> ABSLibraryItemExpandedPodcast:
         """Get a single Podcast by ID."""
         # this endpoint gives more podcast extra data
         data = await self._get(f"items/{id_}?expanded=1")
-        return ABSLibraryItemExpandedPodcast.from_json(data)
+        try:
+            abs_podcast = ABSLibraryItemExpandedPodcast.from_json(data)
+        except (MissingField, InvalidFieldValue) as exc:
+            self.logger.error(exc)
+            raise RuntimeError from exc
+        return abs_podcast
 
     async def _get_progress_ms(
         self,
@@ -222,7 +241,11 @@ class ABSClient:
         if not data:
             # entry doesn't exist, so it wasn't played yet
             return 0, False
-        abs_media_progress = ABSMediaProgress.from_json(data)
+        try:
+            abs_media_progress = ABSMediaProgress.from_json(data)
+        except (MissingField, InvalidFieldValue) as exc:
+            self.logger.error(exc)
+            return None, False
 
         return (
             int(abs_media_progress.current_time * 1000),
@@ -301,36 +324,42 @@ class ABSClient:
         endpoint = f"me/progress/{audiobook_id}"
         await self._update_progress(endpoint, progress_s, duration_s, is_finished)
 
-    async def get_all_audiobooks(self) -> AsyncGenerator[ABSLibraryItemExpandedBook]:
+    async def get_all_audiobooks_minified(self) -> AsyncGenerator[ABSLibraryItemMinifiedBook]:
         """Get all audiobooks."""
         for library in self.audiobook_libraries:
-            async for book in self.get_all_audiobooks_by_library(library):
+            async for book in self.get_all_audiobooks_by_library_minified(library):
                 yield book
 
-    async def get_all_audiobooks_by_library(
-        self, lib: ABSLibrary
-    ) -> AsyncGenerator[ABSLibraryItemExpandedBook]:
+    async def get_all_audiobooks_by_library_minified(
+        self, lib: LibraryWithItemIDs
+    ) -> AsyncGenerator[ABSLibraryItemMinifiedBook]:
         """Get all Audiobooks in a library."""
         async for audiobook_data in self._get_lib_items(lib):
-            audiobook_list = ABSLibrariesItemsMinifiedBookResponse.from_json(audiobook_data).results
+            try:
+                audiobook_list = ABSLibrariesItemsMinifiedBookResponse.from_json(
+                    audiobook_data
+                ).results
+            except (MissingField, InvalidFieldValue) as exc:
+                self.logger.error(exc)
+                return
             if not audiobook_list:  # [] if page exceeds
                 return
 
-            async def _get_id(
-                alist: list[ABSLibraryItemMinifiedBook] = audiobook_list,
-            ) -> AsyncGenerator[str]:
-                for entry in alist:
-                    yield entry.id_
-
-            async for id_ in _get_id():
-                audiobook = await self.get_audiobook(id_)
+            for audiobook in audiobook_list:
+                # store ids of library items for later use
+                lib.item_ids.append(audiobook.id_)
                 yield audiobook
 
-    async def get_audiobook(self, id_: str) -> ABSLibraryItemExpandedBook:
+    async def get_audiobook_expanded(self, id_: str) -> ABSLibraryItemExpandedBook:
         """Get a single Audiobook by ID."""
         # this endpoint gives more audiobook extra data
         audiobook = await self._get(f"items/{id_}?expanded=1")
-        return ABSLibraryItemExpandedBook.from_json(audiobook)
+        try:
+            abs_book = ABSLibraryItemExpandedBook.from_json(audiobook)
+        except (MissingField, InvalidFieldValue) as exc:
+            self.logger.error(exc)
+            raise RuntimeError from exc
+        return abs_book
 
     async def get_playback_session_podcast(
         self, device_info: ABSDeviceInfo, podcast_id: str, episode_id: str
@@ -359,14 +388,6 @@ class ABSClient:
         device_info.device_id += f"/{audiobook_id}"
         return await self._get_playback_session(endpoint, device_info=device_info)
 
-    async def get_open_playback_session(self, session_id: str) -> ABSPlaybackSessionExpanded | None:
-        """Return open playback session."""
-        data = await self._get(f"session/{session_id}")
-        if data:
-            return ABSPlaybackSessionExpanded.from_json(data)
-        else:
-            return None
-
     async def _get_playback_session(
         self, endpoint: str, device_info: ABSDeviceInfo
     ) -> ABSPlaybackSessionExpanded:
@@ -383,7 +404,12 @@ class ABSClient:
             supported_mime_types=[],
         )
         data = await self._post(endpoint, data=play_request.to_dict())
-        session = ABSPlaybackSessionExpanded.from_json(data)
+        try:
+            session = ABSPlaybackSessionExpanded.from_json(data)
+        except (MissingField, InvalidFieldValue) as exc:
+            self.logger.error(exc)
+            raise RuntimeError from exc
+
         self.logger.debug(
             f"Got playback session {session.id_} "
             f"for {session.media_type} named {session.display_title}"
@@ -403,26 +429,26 @@ class ABSClient:
         """Sync an open playback session."""
         await self._post(f"session/{playback_session_id}/sync", data=update.to_dict())
 
-    async def get_all_closed_playback_sessions(self) -> AsyncGenerator[ABSPlaybackSession]:
-        """Get library items with pagination.
-
-        This returns only sessions, which are already closed.
-        """
-        page_cnt = 0
-        while True:
-            data = await self._get(
-                "me/listening-sessions",
-                params={"itemsPerPage": LIMIT_ITEMS_PER_PAGE, "page": page_cnt},
-            )
-            page_cnt += 1
-
-            sessions = ABSSessionsResponse.from_json(data).sessions
-            self.logger.debug([session.device_info for session in sessions])
-            if sessions:
-                for session in sessions:
-                    yield session
-            else:
-                return
+    # async def get_all_closed_playback_sessions(self) -> AsyncGenerator[ABSPlaybackSession]:
+    #     """Get library items with pagination.
+    #
+    #     This returns only sessions, which are already closed.
+    #     """
+    #     page_cnt = 0
+    #     while True:
+    #         data = await self._get(
+    #             "me/listening-sessions",
+    #             params={"itemsPerPage": LIMIT_ITEMS_PER_PAGE, "page": page_cnt},
+    #         )
+    #         page_cnt += 1
+    #
+    #         sessions = ABSSessionsResponse.from_json(data).sessions
+    #         # self.logger.debug([session.device_info for session in sessions])
+    #         if sessions:
+    #             for session in sessions:
+    #                 yield session
+    #         else:
+    #             return
 
     async def close_all_playback_sessions(self) -> None:
         """Cleanup all playback sessions opened by us."""

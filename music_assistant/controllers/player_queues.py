@@ -132,9 +132,8 @@ class PlayerQueuesController(CoreController):
         """Cleanup on exit."""
         # stop all playback
         for queue in self.all():
-            if queue.state not in (PlayerState.PLAYING, PlayerState.PAUSED):
-                continue
-            await self.stop(queue.queue_id)
+            if queue.state in (PlayerState.PLAYING, PlayerState.PAUSED):
+                await self.stop(queue.queue_id)
 
     async def get_config_entries(
         self,
@@ -726,7 +725,7 @@ class PlayerQueuesController(CoreController):
             # use current position as resume position
             resume_pos = queue.corrected_elapsed_time
         else:
-            resume_pos = queue.resume_pos
+            resume_pos = queue.resume_pos or queue.elapsed_time
 
         if not resume_item and queue.current_index is not None and len(queue_items) > 0:
             resume_item = self.get_item(queue_id, queue.current_index)
@@ -815,9 +814,9 @@ class PlayerQueuesController(CoreController):
     ) -> None:
         """Transfer queue to another queue."""
         if not (source_queue := self.get(source_queue_id)):
-            raise PlayerUnavailableError("Queue {source_queue_id} is not available")
+            raise PlayerUnavailableError(f"Queue {source_queue_id} is not available")
         if not (target_queue := self.get(target_queue_id)):
-            raise PlayerUnavailableError("Queue {target_queue_id} is not available")
+            raise PlayerUnavailableError(f"Queue {target_queue_id} is not available")
         if auto_play is None:
             auto_play = source_queue.state == PlayerState.PLAYING
 
@@ -1145,6 +1144,8 @@ class PlayerQueuesController(CoreController):
         cur_index = self.index_by_id(queue_id, current_item_id)
         idx = 0
         while True:
+            if cur_index is None:
+                break
             next_item: QueueItem | None = None
             next_index = self._get_next_index(queue_id, cur_index + idx)
             if next_index is None:
