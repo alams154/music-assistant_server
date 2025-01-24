@@ -69,10 +69,12 @@ if TYPE_CHECKING:
     )
     from music_assistant_models.provider import ProviderManifest
 
-    from music_assistant import MusicAssistant
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
 CONF_URL = "url"
+
+SUPPORTED_FEATURES = {ProviderFeature.UNKNOWN}
 
 
 async def setup(
@@ -82,7 +84,7 @@ async def setup(
     # setup is called when the user wants to setup a new provider instance.
     # you are free to do any preflight checks here and but you must return
     #  an instance of the provider.
-    return MyDemoPlayerprovider(mass, manifest, config)
+    return AlexaProvider(mass, manifest, config)
 
 
 async def get_config_entries(
@@ -114,7 +116,7 @@ async def get_config_entries(
     )
 
 
-class MyDemoPlayerprovider(PlayerProvider):
+class AlexaProvider(PlayerProvider):
     """
     Example/demo Player provider.
 
@@ -138,7 +140,7 @@ class MyDemoPlayerprovider(PlayerProvider):
         # you should return a tuple of provider-level features
         # here that your player provider supports or an empty tuple if none.
         # for example 'ProviderFeature.SYNC_PLAYERS' if you can sync players.
-        return (ProviderFeature.SYNC_PLAYERS,)
+        return SUPPORTED_FEATURES
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
@@ -182,30 +184,17 @@ class MyDemoPlayerprovider(PlayerProvider):
                 )
                 await self.mass.players.register_or_update(player)
 
-        player_id = "test"
-        player = Player(
-            player_id=player_id,
-            provider=self.instance_id,
-            type=PlayerType.PLAYER,
-            name=player_id,
-            available=True,
-            powered=False,
-            device_info=DeviceInfo(),
-            supported_features={PlayerFeature.VOLUME_SET},
-        )
-        await self.mass.players.register_or_update(player)
+    # async def unload(self) -> None:
+    #     """
+    #     Handle unload/close of the provider.
 
-    async def unload(self) -> None:
-        """
-        Handle unload/close of the provider.
-
-        Called when provider is deregistered (e.g. MA exiting or config reloading).
-        """
-        # OPTIONAL
-        # this is an optional method that you can implement if
-        # relevant or leave out completely if not needed.
-        # it will be called when the provider is unloaded from Music Assistant.
-        # this means also when the provider is getting reloaded
+    #     Called when provider is deregistered (e.g. MA exiting or config reloading).
+    #     """
+    #     # OPTIONAL
+    #     # this is an optional method that you can implement if
+    #     # relevant or leave out completely if not needed.
+    #     # it will be called when the provider is unloaded from Music Assistant.
+    #     # this means also when the provider is getting reloaded
 
     async def get_player_config_entries(self, player_id: str) -> tuple[ConfigEntry, ...]:
         """Return all (provider/player specific) Config Entries for the given player (if any)."""
@@ -237,6 +226,7 @@ class MyDemoPlayerprovider(PlayerProvider):
         # this method should send a stop command to the given player.
         if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
             return
+        AlexaAPI.stop(player_id)
         player.state = PlayerState.IDLE
         self.mass.players.update(player_id)
 
@@ -245,21 +235,41 @@ class MyDemoPlayerprovider(PlayerProvider):
         # MANDATORY
         # this method is mandatory and should be implemented.
         # this method should send a play command to the given player.
+        if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
+            return
+        AlexaAPI.play(player_id)
+        player.state = PlayerState.PLAYING
+        self.mass.players.update(player_id)
 
     async def cmd_pause(self, player_id: str) -> None:
         """Send PAUSE command to given player."""
         # OPTIONAL - required only if you specified PlayerFeature.PAUSE
         # this method should send a pause command to the given player.
+        if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
+            return
+        AlexaAPI.pause(player_id)
+        player.state = PlayerState.PLAYING
+        self.mass.players.update(player_id)
 
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
         """Send VOLUME_SET command to given player."""
         # OPTIONAL - required only if you specified PlayerFeature.VOLUME_SET
         # this method should send a volume set command to the given player.
+        if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
+            return
+        AlexaAPI.set_volume(player_id, volume_level)
+        player.volume_level = volume_level
+        self.mass.players.update(player_id)
 
     async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
         """Send VOLUME MUTE command to given player."""
         # OPTIONAL - required only if you specified PlayerFeature.VOLUME_MUTE
         # this method should send a volume mute command to the given player.
+        if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
+            return
+        AlexaAPI.set_volume(player_id, 0)
+        player.volume_level = 0
+        self.mass.players.update(player_id)
 
     async def cmd_seek(self, player_id: str, position: int) -> None:
         """Handle SEEK command for given queue.
@@ -312,6 +322,7 @@ class MyDemoPlayerprovider(PlayerProvider):
         # Slimproto and Google Cast.
         if not (player := self.mass.players.get(player_id)):
             return
+        AlexaAPI.run_custom("Play music from Music Assistant")
         player.current_media = media
         player.elapsed_time = 0
         player.elapsed_time_last_updated = time.time()
@@ -332,6 +343,9 @@ class MyDemoPlayerprovider(PlayerProvider):
         This will NOT be called if the player is using flow mode to playback the queue.
         """
         # this method should handle the enqueuing of the next queue item on the player.
+        # if not (player := self.mass.players.get(player_id)):
+        #     return
+        AlexaAPI.next(player_id)
 
     async def cmd_group(self, player_id: str, target_player: str) -> None:
         """Handle GROUP command for given player.
@@ -352,8 +366,6 @@ class MyDemoPlayerprovider(PlayerProvider):
 
             - player_id: player_id of the player to handle the command.
         """
-        sonos_player = self.sonos_players[player_id]
-        await sonos_player.client.player.leave_group()
 
     async def play_announcement(
         self, player_id: str, announcement: PlayerMedia, volume_level: int | None = None
