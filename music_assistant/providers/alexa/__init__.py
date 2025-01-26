@@ -117,56 +117,54 @@ async def get_config_entries(
 
 
 class AlexaProvider(PlayerProvider):
-    """
-    Example/demo Player provider.
+    """Implementation of an Alexa Device Provider."""
 
-    Note that this is always subclassed from PlayerProvider,
-    which in turn is a subclass of the generic Provider model.
+    class AlexaDevice:
+        """Representation of an Alexa Device."""
 
-    The base implementation already takes care of some convenience methods,
-    such as the mass object and the logger. Take a look at the base class
-    for more information on what is available.
+        _device_type: str
+        device_serial_number: str
+        _device_family: str
+        _cluster_members: str
+        _locale: str
 
-    Just like with any other subclass, make sure that if you override
-    any of the default methods (such as __init__), you call the super() method.
-    In most cases its not needed to override any of the builtin methods and you only
-    implement the abc methods with your actual implementation.
-    """
+        async def createobject(self, player_id: str, login: AlexaLogin) -> None:
+            """Initialize Alexa Device."""
+            devices = await AlexaAPI.get_devices(login)
+
+            for device in devices:
+                if device["accountName"] == player_id:
+                    self._device_type = device["deviceType"]
+                    self.device_serial_number = device["serialNumber"]
+                    self._device_family = device["deviceOwnerCustomerId"]
+                    self._cluster_members = device["clusterMembers"]
+                    self._locale = "en-US"
+
+    login: AlexaLogin
 
     @property
     def supported_features(self) -> set[ProviderFeature]:
         """Return the features supported by this Provider."""
-        # MANDATORY
-        # you should return a tuple of provider-level features
-        # here that your player provider supports or an empty tuple if none.
-        # for example 'ProviderFeature.SYNC_PLAYERS' if you can sync players.
         return SUPPORTED_FEATURES
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
-        # OPTIONAL
-        # this is an optional method that you can implement if
-        # relevant or leave out completely if not needed.
-        # it will be called after the provider has been fully loaded into Music Assistant.
-        # you can use this for instance to trigger custom (non-mdns) discovery of players
-        # or any other logic that needs to run after the provider is fully loaded.
-        # Initialize alexapy and login to Amazon account
-        login: AlexaLogin = AlexaLogin(
+        self.login = AlexaLogin(
             url=self.config.get_value(CONF_URL),
             email=self.config.get_value(CONF_USERNAME),
             password=self.config.get_value(CONF_PASSWORD),
             outputpath=lambda x: x,
         )
 
-        login._cookiefile = [
-            login._outputpath(
+        self.login._cookiefile = [
+            self.login._outputpath(
                 f"/home/user/music-assistant_server/music_assistant/providers/alexa/alexa_media.{self.config.get_value(CONF_USERNAME)}.pickle"
             ),
         ]
 
-        await login.login(cookies=await login.load_cookie())
+        await self.login.login(cookies=await self.login.load_cookie())
 
-        devices = await AlexaAPI.get_devices(login)
+        devices = await AlexaAPI.get_devices(self.login)
 
         for device in devices:
             if device.get("capabilities") and "MUSIC_SKILL" in device.get("capabilities"):
@@ -221,53 +219,66 @@ class AlexaProvider(PlayerProvider):
 
     async def cmd_stop(self, player_id: str) -> None:
         """Send STOP command to given player."""
-        # MANDATORY
-        # this method is mandatory and should be implemented.
-        # this method should send a stop command to the given player.
         if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
             return
-        AlexaAPI.stop(player_id)
+
+        device_object = self.AlexaDevice()
+        await device_object.createobject(player_id, self.login)
+        api = AlexaAPI(device_object, self.login)
+        await api.stop()
+
         player.state = PlayerState.IDLE
         self.mass.players.update(player_id)
 
     async def cmd_play(self, player_id: str) -> None:
         """Send PLAY command to given player."""
-        # MANDATORY
-        # this method is mandatory and should be implemented.
-        # this method should send a play command to the given player.
         if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
             return
-        AlexaAPI.play(player_id)
+
+        device_object = self.AlexaDevice()
+        await device_object.createobject(player_id, self.login)
+        api = AlexaAPI(device_object, self.login)
+        await api.play()
+
         player.state = PlayerState.PLAYING
         self.mass.players.update(player_id)
 
     async def cmd_pause(self, player_id: str) -> None:
         """Send PAUSE command to given player."""
-        # OPTIONAL - required only if you specified PlayerFeature.PAUSE
-        # this method should send a pause command to the given player.
         if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
             return
-        AlexaAPI.pause(player_id)
+
+        device_object = self.AlexaDevice()
+        await device_object.createobject(player_id, self.login)
+        api = AlexaAPI(device_object, self.login)
+        await api.pause()
+
         player.state = PlayerState.PLAYING
         self.mass.players.update(player_id)
 
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
         """Send VOLUME_SET command to given player."""
-        # OPTIONAL - required only if you specified PlayerFeature.VOLUME_SET
-        # this method should send a volume set command to the given player.
         if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
             return
-        AlexaAPI.set_volume(player_id, volume_level)
+
+        device_object = self.AlexaDevice()
+        await device_object.createobject(player_id, self.login)
+        api = AlexaAPI(device_object, self.login)
+        await api.set_volume(volume_level / 100)
+
         player.volume_level = volume_level
         self.mass.players.update(player_id)
 
     async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
         """Send VOLUME MUTE command to given player."""
-        # OPTIONAL - required only if you specified PlayerFeature.VOLUME_MUTE
-        # this method should send a volume mute command to the given player.
         if not (player := self.mass.players.get(player_id, raise_unavailable=False)):
             return
-        AlexaAPI.set_volume(player_id, 0)
+
+        device_object = self.AlexaDevice()
+        await device_object.createobject(player_id, self.login)
+        api = AlexaAPI(device_object, self.login)
+        await api.set_volume(0)
+
         player.volume_level = 0
         self.mass.players.update(player_id)
 
@@ -322,7 +333,12 @@ class AlexaProvider(PlayerProvider):
         # Slimproto and Google Cast.
         if not (player := self.mass.players.get(player_id)):
             return
-        AlexaAPI.run_custom("Play music from Music Assistant")
+
+        device_object = self.AlexaDevice()
+        await device_object.createobject(player_id, self.login)
+        api = AlexaAPI(device_object, self.login)
+        await api.run_custom("Ask music assistant to play audio")
+
         player.current_media = media
         player.elapsed_time = 0
         player.elapsed_time_last_updated = time.time()
@@ -345,7 +361,11 @@ class AlexaProvider(PlayerProvider):
         # this method should handle the enqueuing of the next queue item on the player.
         # if not (player := self.mass.players.get(player_id)):
         #     return
-        AlexaAPI.next(player_id)
+        device_object = self.AlexaDevice()
+        await device_object.createobject(player_id, self.login)
+        api = AlexaAPI(device_object, self.login)
+        await api.next()
+        # await AlexaAPI.next(player_id)
 
     async def cmd_group(self, player_id: str, target_player: str) -> None:
         """Handle GROUP command for given player.
