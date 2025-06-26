@@ -94,7 +94,8 @@ async def get_config_entries(
             proxy_path = "/alexa/auth/proxy/"
             post_path = "/alexa/auth/proxy/ap/signin/*"
             base_url = mass.webserver.base_url.rstrip("/")
-            proxy_url = f"{base_url}{proxy_path}"
+            port = mass.webserver.publish_port
+            proxy_url = f"{base_url}:{port}{proxy_path}"
 
             # Create AlexaProxy instance
             proxy = AlexaProxy(login, proxy_url)
