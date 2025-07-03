@@ -39,7 +39,7 @@ class AuthenticationHelper:
     @property
     def callback_url(self) -> str:
         """Return the callback URL."""
-        return f"{self.mass.webserver.base_url}{self._cb_path}"
+        return f"{self.mass.webserver.base_url}:{self.mass.webserver.publish_port}{self._cb_path}"
 
     async def __aenter__(self) -> AuthenticationHelper:
         """Enter context manager."""
